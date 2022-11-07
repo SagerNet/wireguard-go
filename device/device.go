@@ -281,7 +281,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	return nil
 }
 
-func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
+func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger, workers int) *Device {
 	device := new(Device)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
@@ -308,10 +308,12 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 
 	// start workers
 
-	cpus := runtime.NumCPU()
+	if workers == 0 {
+		workers = runtime.NumCPU()
+	}
 	device.state.stopping.Wait()
-	device.queue.encryption.wg.Add(cpus) // One for each RoutineHandshake
-	for i := 0; i < cpus; i++ {
+	device.queue.encryption.wg.Add(workers) // One for each RoutineHandshake
+	for i := 0; i < workers; i++ {
 		go device.RoutineEncryption(i + 1)
 		go device.RoutineDecryption(i + 1)
 		go device.RoutineHandshake(i + 1)
