@@ -8,9 +8,9 @@ package device
 import (
 	"crypto/cipher"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"go.uber.org/atomic"
 	"github.com/sagernet/wireguard-go/replay"
 )
 

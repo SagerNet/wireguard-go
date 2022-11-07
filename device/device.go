@@ -8,9 +8,9 @@ package device
 import (
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"go.uber.org/atomic"
 	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/ratelimiter"
 	"github.com/sagernet/wireguard-go/rwcancel"

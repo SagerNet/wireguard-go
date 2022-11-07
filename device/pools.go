@@ -7,7 +7,8 @@ package device
 
 import (
 	"sync"
-	"sync/atomic"
+
+	"go.uber.org/atomic"
 )
 
 type WaitPool struct {

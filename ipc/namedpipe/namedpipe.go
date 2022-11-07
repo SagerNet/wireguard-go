@@ -15,10 +15,10 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"go.uber.org/atomic"
 	"golang.org/x/sys/windows"
 )
 

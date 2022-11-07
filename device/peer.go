@@ -9,9 +9,9 @@ import (
 	"container/list"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"go.uber.org/atomic"
 	"github.com/sagernet/wireguard-go/conn"
 )
 
