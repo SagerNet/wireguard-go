@@ -16,14 +16,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const (
-	IpcErrorIO        = -int64(unix.EIO)
-	IpcErrorProtocol  = -int64(unix.EPROTO)
-	IpcErrorInvalid   = -int64(unix.EINVAL)
-	IpcErrorPortInUse = -int64(unix.EADDRINUSE)
-	IpcErrorUnknown   = -55 // ENOANO
-)
-
 // socketDirectory is variable because it is modified by a linker
 // flag in wireguard-android.
 var socketDirectory = "/var/run/wireguard"

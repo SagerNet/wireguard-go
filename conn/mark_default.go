@@ -1,4 +1,4 @@
-//go:build !linux && !openbsd && !freebsd
+//go:build !linux && !openbsd && !freebsd && !dragonfly
 
 /* SPDX-License-Identifier: MIT
  *
