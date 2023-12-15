@@ -14,7 +14,7 @@ import (
 )
 
 func init() {
-	controlFns = append(controlFns,
+	ControlFns = append(ControlFns,
 		func(network, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
 				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, socketBufferSize)
