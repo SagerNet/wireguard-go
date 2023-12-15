@@ -7,12 +7,12 @@ package device
 
 import (
 	"context"
-	"github.com/sagernet/sing/service"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/ratelimiter"
