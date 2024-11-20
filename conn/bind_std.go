@@ -20,9 +20,7 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-var (
-	_ Bind = (*StdNetBind)(nil)
-)
+var _ Bind = (*StdNetBind)(nil)
 
 // StdNetBind implements Bind for all platforms. While Windows has its own Bind
 // (see bind_windows.go), it may fall back to StdNetBind.
@@ -210,10 +208,8 @@ func (s *StdNetBind) getMessages() *[]ipv6.Message {
 	return s.msgsPool.Get().(*[]ipv6.Message)
 }
 
-var (
-	// If compilation fails here these are no longer the same underlying type.
-	_ ipv6.Message = ipv4.Message{}
-)
+// If compilation fails here these are no longer the same underlying type.
+var _ ipv6.Message = ipv4.Message{}
 
 type batchReader interface {
 	ReadBatch([]ipv6.Message, int) (int, error)

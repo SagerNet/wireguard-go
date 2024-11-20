@@ -84,7 +84,6 @@ func UAPIListen(name string, file *os.File) (net.Listener, error) {
 			unix.IN_DELETE|
 			unix.IN_DELETE_SELF,
 	)
-
 	if err != nil {
 		return nil, err
 	}

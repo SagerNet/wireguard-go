@@ -10,9 +10,7 @@ import (
 )
 
 func TestPrettyName(t *testing.T) {
-	var (
-		recvFunc ReceiveFunc = func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) { return }
-	)
+	var recvFunc ReceiveFunc = func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) { return }
 
 	const want = "TestPrettyName"
 
