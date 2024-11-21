@@ -14,10 +14,10 @@ import (
 
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/ratelimiter"
-	"golang.zx2c4.com/wireguard/rwcancel"
-	"golang.zx2c4.com/wireguard/tun"
+	"github.com/sagernet/wireguard-go/conn"
+	"github.com/sagernet/wireguard-go/ratelimiter"
+	"github.com/sagernet/wireguard-go/rwcancel"
+	"github.com/sagernet/wireguard-go/tun"
 )
 
 type Device struct {
