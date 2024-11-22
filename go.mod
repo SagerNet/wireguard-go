@@ -1,4 +1,4 @@
-module github.com/tailscale/wireguard-go
+module github.com/sagernet/wireguard-go
 
 go 1.20
 

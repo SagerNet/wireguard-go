@@ -5,7 +5,7 @@
 
 package device
 
-import "github.com/tailscale/wireguard-go/conn"
+import "github.com/sagernet/wireguard-go/conn"
 
 /* Reduce memory consumption for Android */
 
