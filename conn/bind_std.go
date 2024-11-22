@@ -213,10 +213,8 @@ func (s *StdNetBind) getMessages() *[]ipv6.Message {
 	return s.msgsPool.Get().(*[]ipv6.Message)
 }
 
-var (
-	// If compilation fails here these are no longer the same underlying type.
-	_ ipv6.Message = ipv4.Message{}
-)
+// If compilation fails here these are no longer the same underlying type.
+var _ ipv6.Message = ipv4.Message{}
 
 type batchReader interface {
 	ReadBatch([]ipv6.Message, int) (int, error)

@@ -506,9 +506,7 @@ func (tun *NativeTun) initFromFlags(name string) error {
 		return err
 	}
 	if e := sc.Control(func(fd uintptr) {
-		var (
-			ifr *unix.Ifreq
-		)
+		var ifr *unix.Ifreq
 		ifr, err = unix.NewIfreq(name)
 		if err != nil {
 			return

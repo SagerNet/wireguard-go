@@ -18,10 +18,9 @@ import (
 	"sync"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/rwcancel"
+	"golang.org/x/sys/unix"
 )
 
 func (device *Device) startRouteListener(bind conn.Bind) (*rwcancel.RWCancel, error) {

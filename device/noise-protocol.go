@@ -11,11 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/wireguard-go/tai64n"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
-
-	"github.com/sagernet/wireguard-go/tai64n"
 )
 
 type handshakeState int
