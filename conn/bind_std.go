@@ -139,7 +139,11 @@ func listenNet(listener Listener, network string, port int) (*net.UDPConn, int, 
 	if err != nil {
 		return nil, 0, err
 	}
-	return conn.(*net.UDPConn), uaddr.Port, nil
+	udpConn, isUdpConn := common.Cast[*net.UDPConn](conn)
+	if !isUdpConn {
+		return nil, 0, errors.New("not found UDP conn")
+	}
+	return udpConn, uaddr.Port, nil
 }
 
 // errEADDRINUSE is syscall.EADDRINUSE, boxed into an interface once
