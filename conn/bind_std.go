@@ -55,7 +55,8 @@ type StdNetBind struct {
 
 func NewStdNetBind(listener Listener) Bind {
 	return &StdNetBind{
-		listener: listener,
+		listener:            listener,
+		reservedForEndpoint: make(map[netip.AddrPort][3]uint8),
 
 		udpAddrPool: sync.Pool{
 			New: func() any {
