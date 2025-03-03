@@ -16,9 +16,11 @@ import (
 	"github.com/sagernet/sing/service/pause"
 
 	"github.com/sagernet/wireguard-go/conn"
+	"github.com/sagernet/wireguard-go/ipc"
 	"github.com/sagernet/wireguard-go/ratelimiter"
 	"github.com/sagernet/wireguard-go/rwcancel"
 	"github.com/sagernet/wireguard-go/tun"
+	"github.com/tevino/abool/v2"
 )
 
 type Device struct {
@@ -94,6 +96,22 @@ type Device struct {
 	closed       chan struct{}
 	log          *Logger
 	pauseManager pause.Manager
+	isASecOn     abool.AtomicBool
+	aSecMux      sync.RWMutex
+	aSecCfg      aSecCfgType
+}
+
+type aSecCfgType struct {
+	isSet                      bool
+	junkPacketCount            int
+	junkPacketMinSize          int
+	junkPacketMaxSize          int
+	initPacketJunkSize         int
+	responsePacketJunkSize     int
+	initPacketMagicHeader      uint32
+	responsePacketMagicHeader  uint32
+	underloadPacketMagicHeader uint32
+	transportPacketMagicHeader uint32
 }
 
 // deviceState represents the state of a Device.
@@ -376,10 +394,10 @@ func (device *Device) RemoveAllPeers() {
 }
 
 func (device *Device) Close() {
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
 	device.state.Lock()
 	defer device.state.Unlock()
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
 	if device.isClosed() {
 		return
 	}
@@ -402,6 +420,8 @@ func (device *Device) Close() {
 	device.state.stopping.Wait()
 
 	device.rate.limiter.Close()
+
+	device.resetProtocol()
 
 	device.log.Verbosef("Device closed")
 	close(device.closed)
@@ -540,5 +560,252 @@ func (device *Device) BindClose() error {
 	device.net.Lock()
 	err := closeBindLocked(device)
 	device.net.Unlock()
+	return err
+}
+func (device *Device) isAdvancedSecurityOn() bool {
+	return device.isASecOn.IsSet()
+}
+
+func (device *Device) resetProtocol() {
+	// restore default message type values
+	MessageInitiationType = 1
+	MessageResponseType = 2
+	MessageCookieReplyType = 3
+	MessageTransportType = 4
+}
+
+func (device *Device) handlePostConfig(tempASecCfg *aSecCfgType) (err error) {
+
+	if !tempASecCfg.isSet {
+		return err
+	}
+
+	isASecOn := false
+	device.aSecMux.Lock()
+	if tempASecCfg.junkPacketCount < 0 {
+		err = ipcErrorf(
+			ipc.IpcErrorInvalid,
+			"JunkPacketCount should be non negative",
+		)
+	}
+	device.aSecCfg.junkPacketCount = tempASecCfg.junkPacketCount
+	if tempASecCfg.junkPacketCount != 0 {
+		isASecOn = true
+	}
+
+	device.aSecCfg.junkPacketMinSize = tempASecCfg.junkPacketMinSize
+	if tempASecCfg.junkPacketMinSize != 0 {
+		isASecOn = true
+	}
+
+	if device.aSecCfg.junkPacketCount > 0 &&
+		tempASecCfg.junkPacketMaxSize == tempASecCfg.junkPacketMinSize {
+
+		tempASecCfg.junkPacketMaxSize++ // to make rand gen work
+	}
+
+	if tempASecCfg.junkPacketMaxSize >= MaxSegmentSize {
+		device.aSecCfg.junkPacketMinSize = 0
+		device.aSecCfg.junkPacketMaxSize = 1
+		if err != nil {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				"JunkPacketMaxSize: %d; should be smaller than maxSegmentSize: %d; %w",
+				tempASecCfg.junkPacketMaxSize,
+				MaxSegmentSize,
+				err,
+			)
+		} else {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				"JunkPacketMaxSize: %d; should be smaller than maxSegmentSize: %d",
+				tempASecCfg.junkPacketMaxSize,
+				MaxSegmentSize,
+			)
+		}
+	} else if tempASecCfg.junkPacketMaxSize < tempASecCfg.junkPacketMinSize {
+		if err != nil {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				"maxSize: %d; should be greater than minSize: %d; %w",
+				tempASecCfg.junkPacketMaxSize,
+				tempASecCfg.junkPacketMinSize,
+				err,
+			)
+		} else {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				"maxSize: %d; should be greater than minSize: %d",
+				tempASecCfg.junkPacketMaxSize,
+				tempASecCfg.junkPacketMinSize,
+			)
+		}
+	} else {
+		device.aSecCfg.junkPacketMaxSize = tempASecCfg.junkPacketMaxSize
+	}
+
+	if tempASecCfg.junkPacketMaxSize != 0 {
+		isASecOn = true
+	}
+
+	if MessageInitiationSize+tempASecCfg.initPacketJunkSize >= MaxSegmentSize {
+		if err != nil {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				`init header size(148) + junkSize:%d; should be smaller than maxSegmentSize: %d; %w`,
+				tempASecCfg.initPacketJunkSize,
+				MaxSegmentSize,
+				err,
+			)
+		} else {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				`init header size(148) + junkSize:%d; should be smaller than maxSegmentSize: %d`,
+				tempASecCfg.initPacketJunkSize,
+				MaxSegmentSize,
+			)
+		}
+	} else {
+		device.aSecCfg.initPacketJunkSize = tempASecCfg.initPacketJunkSize
+	}
+
+	if tempASecCfg.initPacketJunkSize != 0 {
+		isASecOn = true
+	}
+
+	if MessageResponseSize+tempASecCfg.responsePacketJunkSize >= MaxSegmentSize {
+		if err != nil {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				`response header size(92) + junkSize:%d; should be smaller than maxSegmentSize: %d; %w`,
+				tempASecCfg.responsePacketJunkSize,
+				MaxSegmentSize,
+				err,
+			)
+		} else {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				`response header size(92) + junkSize:%d; should be smaller than maxSegmentSize: %d`,
+				tempASecCfg.responsePacketJunkSize,
+				MaxSegmentSize,
+			)
+		}
+	} else {
+		device.aSecCfg.responsePacketJunkSize = tempASecCfg.responsePacketJunkSize
+	}
+
+	if tempASecCfg.responsePacketJunkSize != 0 {
+		isASecOn = true
+	}
+
+	if tempASecCfg.initPacketMagicHeader > 4 {
+		isASecOn = true
+		device.log.Verbosef("UAPI: Updating init_packet_magic_header")
+		device.aSecCfg.initPacketMagicHeader = tempASecCfg.initPacketMagicHeader
+		MessageInitiationType = device.aSecCfg.initPacketMagicHeader
+	} else {
+		device.log.Verbosef("UAPI: Using default init type")
+		MessageInitiationType = 1
+	}
+
+	if tempASecCfg.responsePacketMagicHeader > 4 {
+		isASecOn = true
+		device.log.Verbosef("UAPI: Updating response_packet_magic_header")
+		device.aSecCfg.responsePacketMagicHeader = tempASecCfg.responsePacketMagicHeader
+		MessageResponseType = device.aSecCfg.responsePacketMagicHeader
+	} else {
+		device.log.Verbosef("UAPI: Using default response type")
+		MessageResponseType = 2
+	}
+
+	if tempASecCfg.underloadPacketMagicHeader > 4 {
+		isASecOn = true
+		device.log.Verbosef("UAPI: Updating underload_packet_magic_header")
+		device.aSecCfg.underloadPacketMagicHeader = tempASecCfg.underloadPacketMagicHeader
+		MessageCookieReplyType = device.aSecCfg.underloadPacketMagicHeader
+	} else {
+		device.log.Verbosef("UAPI: Using default underload type")
+		MessageCookieReplyType = 3
+	}
+
+	if tempASecCfg.transportPacketMagicHeader > 4 {
+		isASecOn = true
+		device.log.Verbosef("UAPI: Updating transport_packet_magic_header")
+		device.aSecCfg.transportPacketMagicHeader = tempASecCfg.transportPacketMagicHeader
+		MessageTransportType = device.aSecCfg.transportPacketMagicHeader
+	} else {
+		device.log.Verbosef("UAPI: Using default transport type")
+		MessageTransportType = 4
+	}
+
+	isSameMap := map[uint32]bool{}
+	isSameMap[MessageInitiationType] = true
+	isSameMap[MessageResponseType] = true
+	isSameMap[MessageCookieReplyType] = true
+	isSameMap[MessageTransportType] = true
+
+	// size will be different if same values
+	if len(isSameMap) != 4 {
+		if err != nil {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				`magic headers should differ; got: init:%d; recv:%d; unde:%d; tran:%d; %w`,
+				MessageInitiationType,
+				MessageResponseType,
+				MessageCookieReplyType,
+				MessageTransportType,
+				err,
+			)
+		} else {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				`magic headers should differ; got: init:%d; recv:%d; unde:%d; tran:%d`,
+				MessageInitiationType,
+				MessageResponseType,
+				MessageCookieReplyType,
+				MessageTransportType,
+			)
+		}
+	}
+
+	newInitSize := MessageInitiationSize + device.aSecCfg.initPacketJunkSize
+	newResponseSize := MessageResponseSize + device.aSecCfg.responsePacketJunkSize
+
+	if newInitSize == newResponseSize {
+		if err != nil {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				`new init size:%d; and new response size:%d; should differ; %w`,
+				newInitSize,
+				newResponseSize,
+				err,
+			)
+		} else {
+			err = ipcErrorf(
+				ipc.IpcErrorInvalid,
+				`new init size:%d; and new response size:%d; should differ`,
+				newInitSize,
+				newResponseSize,
+			)
+		}
+	} else {
+		packetSizeToMsgType = map[int]uint32{
+			newInitSize:            MessageInitiationType,
+			newResponseSize:        MessageResponseType,
+			MessageCookieReplySize: MessageCookieReplyType,
+			MessageTransportSize:   MessageTransportType,
+		}
+
+		msgTypeToJunkSize = map[uint32]int{
+			MessageInitiationType:  device.aSecCfg.initPacketJunkSize,
+			MessageResponseType:    device.aSecCfg.responsePacketJunkSize,
+			MessageCookieReplyType: 0,
+			MessageTransportType:   0,
+		}
+	}
+
+	device.isASecOn.SetTo(isASecOn)
+	device.aSecMux.Unlock()
+
 	return err
 }
