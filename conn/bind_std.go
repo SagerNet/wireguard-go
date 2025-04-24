@@ -126,7 +126,14 @@ func (e *StdNetEndpoint) DstToString() string {
 }
 
 func listenNet(listener Listener, network string, port int) (*net.UDPConn, int, error) {
-	conn, err := listener.ListenPacketCompat(network, ":"+strconv.Itoa(port))
+	var listenerAddr string
+	if network == "udp6" {
+		listenerAddr = "[::]:" + strconv.Itoa(port)
+	} else {
+		listenerAddr = ":" + strconv.Itoa(port)
+	}
+
+	conn, err := listener.ListenPacketCompat(network, listenerAddr)
 	if err != nil {
 		return nil, 0, err
 	}
