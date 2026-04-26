@@ -97,7 +97,7 @@ func (device *Device) flushInboundQueue(q *autodrainingInboundQueue) {
 	for {
 		select {
 		case elemsContainer := <-q.c:
-			elemsContainer.Lock()
+			elemsContainer.filling.Wait()
 			for _, elem := range elemsContainer.elems {
 				device.PutMessageBuffer(elem.buffer)
 				device.PutInboundElement(elem)
@@ -136,7 +136,7 @@ func (device *Device) flushOutboundQueue(q *autodrainingOutboundQueue) {
 	for {
 		select {
 		case elemsContainer := <-q.c:
-			elemsContainer.Lock()
+			elemsContainer.filling.Wait()
 			for _, elem := range elemsContainer.elems {
 				device.PutOutboundBuffer(elem.buffer)
 				device.PutOutboundElement(elem)

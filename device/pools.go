@@ -74,7 +74,6 @@ func (device *Device) PopulatePools() {
 
 func (device *Device) GetInboundElementsContainer() *QueueInboundElementsContainer {
 	c := device.pool.inboundElementsContainer.Get().(*QueueInboundElementsContainer)
-	c.Mutex = sync.Mutex{}
 	return c
 }
 
@@ -88,7 +87,6 @@ func (device *Device) PutInboundElementsContainer(c *QueueInboundElementsContain
 
 func (device *Device) GetOutboundElementsContainer() *QueueOutboundElementsContainer {
 	c := device.pool.outboundElementsContainer.Get().(*QueueOutboundElementsContainer)
-	c.Mutex = sync.Mutex{}
 	return c
 }
 

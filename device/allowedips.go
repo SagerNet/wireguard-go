@@ -329,7 +329,6 @@ func (table *AllowedIPs) Remove(prefix netip.Prefix, peer *Peer) {
 	node.remove()
 }
 
-
 // setPeerPrefixes atomically removes all of peer's existing prefixes and adds
 // the provided ones.
 func (table *AllowedIPs) setPeerPrefixes(peer *Peer, prefixes []netip.Prefix) {
