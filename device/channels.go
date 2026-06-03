@@ -83,8 +83,14 @@ func newAutodrainingInboundQueue(device *Device) *autodrainingInboundQueue {
 	q := &autodrainingInboundQueue{
 		c: make(chan *QueueInboundElementsContainer, QueueInboundSize),
 	}
-	runtime.SetFinalizer(q, device.flushInboundQueue)
+	if device.needsInboundQueueFinalizer() {
+		runtime.SetFinalizer(q, device.flushInboundQueue)
+	}
 	return q
+}
+
+func (device *Device) needsInboundQueueFinalizer() bool {
+	return device.pool.messageBuffers.hasAccounting()
 }
 
 func (device *Device) flushInboundQueue(q *autodrainingInboundQueue) {
@@ -116,8 +122,14 @@ func newAutodrainingOutboundQueue(device *Device) *autodrainingOutboundQueue {
 	q := &autodrainingOutboundQueue{
 		c: make(chan *QueueOutboundElementsContainer, QueueOutboundSize),
 	}
-	runtime.SetFinalizer(q, device.flushOutboundQueue)
+	if device.needsOutboundQueueFinalizer() {
+		runtime.SetFinalizer(q, device.flushOutboundQueue)
+	}
 	return q
+}
+
+func (device *Device) needsOutboundQueueFinalizer() bool {
+	return device.pool.messageBuffers.hasAccounting()
 }
 
 func (device *Device) flushOutboundQueue(q *autodrainingOutboundQueue) {
