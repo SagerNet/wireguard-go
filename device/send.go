@@ -188,6 +188,10 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		peer.handshake.mutex.Unlock()
 		return nil
 	}
+	// handshakeOnUserSend is flipped false after lastSentHandshake checks,
+	// enabling eventual transmission at a future call of this method, while
+	// still honoring [RekeyTimeout].
+	peer.handshakeOnUserSend.Store(false)
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
@@ -282,8 +286,9 @@ func (peer *Peer) keepKeyFreshSending() {
 	if keypair == nil {
 		return
 	}
+	txHandshake := peer.handshakeOnUserSend.Load()
 	nonce := keypair.sendNonce.Load()
-	if nonce > RekeyAfterMessages || (keypair.isInitiator && sinceIncludingSleep(keypair.created) > RekeyAfterTime) {
+	if txHandshake || nonce > RekeyAfterMessages || (keypair.isInitiator && sinceIncludingSleep(keypair.created) > RekeyAfterTime) {
 		peer.SendHandshakeInitiation(false)
 	}
 }
