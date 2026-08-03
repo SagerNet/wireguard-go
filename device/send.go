@@ -87,18 +87,24 @@ func (elem *QueueOutboundElement) clearPointers() {
 	elem.peer = nil
 }
 
-/* Queues a keepalive if no packets are queued for peer
- */
+// SendKeepalive queues a keepalive if no packets are queued for
+// peer.
 func (peer *Peer) SendKeepalive() {
-	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
+	if len(peer.queue.staged) == 0 {
 		elem := peer.device.NewOutboundElement()
 		elemsContainer := peer.device.GetOutboundElementsContainer()
 		elemsContainer.elems = append(elemsContainer.elems, elem)
-		select {
-		case peer.queue.staged <- elemsContainer:
-			peer.queuedOutboundPackets.Add(1)
-			peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
-		default:
+		if queued := peer.doIfRunning(func() {
+			select {
+			case peer.queue.staged <- elemsContainer:
+				peer.queuedOutboundPackets.Add(1)
+				peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
+			default:
+				peer.device.PutOutboundBuffer(elem.buffer)
+				peer.device.PutOutboundElement(elem)
+				peer.device.PutOutboundElementsContainer(elemsContainer)
+			}
+		}); !queued {
 			peer.device.PutOutboundBuffer(elem.buffer)
 			peer.device.PutOutboundElement(elem)
 			peer.device.PutOutboundElementsContainer(elemsContainer)
@@ -140,14 +146,6 @@ func (peer *Peer) SendPriorityMessage() {
 	elem := peer.device.NewOutboundElement()
 	elemsContainer := peer.device.GetOutboundElementsContainer()
 	elemsContainer.elems = append(elemsContainer.elems, elem)
-	packetQueued := false
-	defer func() {
-		if !packetQueued {
-			peer.device.PutOutboundBuffer(elem.buffer)
-			peer.device.PutOutboundElement(elem)
-			peer.device.PutOutboundElementsContainer(elemsContainer)
-		}
-	}()
 
 	// initialize outbound element
 	const offset = MessageEncapsulatingTransportSize + MessageTransportHeaderSize
@@ -157,18 +155,16 @@ func (peer *Peer) SendPriorityMessage() {
 	elem.nonce = keypair.sendNonce.Add(1) - 1
 	if elem.nonce >= RejectAfterMessages {
 		keypair.sendNonce.Store(RejectAfterMessages)
+		peer.device.PutOutboundBuffer(elem.buffer)
+		peer.device.PutOutboundElement(elem)
+		peer.device.PutOutboundElementsContainer(elemsContainer)
 		return
 	}
 	elem.keypair = keypair
 
 	// add to parallel and sequential queue
-	if peer.isRunning.Load() {
-		elemsContainer.filling.Add(1)
-		peer.queuedOutboundPackets.Add(1)
-		peer.queue.outbound.c <- elemsContainer
-		peer.device.queue.encryption.c <- elemsContainer
-		packetQueued = true
-	}
+	peer.queuedOutboundPackets.Add(1)
+	peer.queueOutboundIfRunning(elemsContainer)
 }
 
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
@@ -375,16 +371,8 @@ func (device *Device) RoutineReadFromTUN() {
 		}
 
 		for peer, elemsForPeer := range elemsByPeer {
-			if peer.isRunning.Load() {
-				peer.StagePackets(elemsForPeer)
-				peer.SendStagedPackets()
-			} else {
-				for _, elem := range elemsForPeer.elems {
-					device.PutOutboundBuffer(elem.buffer)
-					device.PutOutboundElement(elem)
-				}
-				device.PutOutboundElementsContainer(elemsForPeer)
-			}
+			peer.StagePackets(elemsForPeer)
+			peer.SendStagedPackets()
 			delete(elemsByPeer, peer)
 		}
 
@@ -483,15 +471,9 @@ func (device *Device) InputPacket(destination []byte, packetSlices [][]byte) {
 	}
 	elem.packet = packet[:n]
 	elemsForPeer := device.GetOutboundElementsContainer()
-	if peer.isRunning.Load() {
-		elemsForPeer.elems = append(elemsForPeer.elems, elem)
-		peer.StagePackets(elemsForPeer)
-		peer.SendStagedPackets()
-	} else {
-		device.PutOutboundBuffer(elem.buffer)
-		device.PutOutboundElement(elem)
-		device.PutOutboundElementsContainer(elemsForPeer)
-	}
+	elemsForPeer.elems = append(elemsForPeer.elems, elem)
+	peer.StagePackets(elemsForPeer)
+	peer.SendStagedPackets()
 }
 
 type InputPacketRef struct {
@@ -537,45 +519,44 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 		elemsForPeer.elems = append(elemsForPeer.elems, elem)
 	}
 	for peer, containers := range elemsByPeer {
-		if peer.isRunning.Load() {
-			for _, elemsForPeer := range containers {
-				peer.StagePackets(elemsForPeer)
-			}
-			peer.SendStagedPackets()
-		} else {
-			for _, elemsForPeer := range containers {
-				for _, elem := range elemsForPeer.elems {
-					device.PutOutboundBuffer(elem.buffer)
-					device.PutOutboundElement(elem)
-				}
-				device.PutOutboundElementsContainer(elemsForPeer)
-			}
+		for _, elemsForPeer := range containers {
+			peer.StagePackets(elemsForPeer)
 		}
+		peer.SendStagedPackets()
 	}
 	return unmatched
 }
 
 func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
-	peer.queuedOutboundPackets.Add(int32(len(elems.elems)))
-	for {
-		select {
-		case peer.queue.staged <- elems:
-			return
-		default:
-		}
-		select {
-		case tooOld := <-peer.queue.staged:
-			peer.queuedOutboundPackets.Add(-int32(len(tooOld.elems)))
-			for _, elem := range tooOld.elems {
-				peer.device.PutOutboundBuffer(elem.buffer)
-				peer.device.PutOutboundElement(elem)
+	if running := peer.doIfRunning(func() {
+		peer.queuedOutboundPackets.Add(int32(len(elems.elems)))
+		for {
+			select {
+			case peer.queue.staged <- elems:
+				return
+			default:
 			}
-			peer.device.PutOutboundElementsContainer(tooOld)
-		default:
+			select {
+			case tooOld := <-peer.queue.staged:
+				peer.queuedOutboundPackets.Add(-int32(len(tooOld.elems)))
+				for _, elem := range tooOld.elems {
+					peer.device.PutOutboundBuffer(elem.buffer)
+					peer.device.PutOutboundElement(elem)
+				}
+				peer.device.PutOutboundElementsContainer(tooOld)
+			default:
+			}
 		}
+	}); !running {
+		for _, elem := range elems.elems {
+			peer.device.PutOutboundBuffer(elem.buffer)
+			peer.device.PutOutboundElement(elem)
+		}
+		peer.device.PutOutboundElementsContainer(elems)
 	}
 }
 
+// SendStagedPackets sends any staged packets to Peer.
 func (peer *Peer) SendStagedPackets() {
 top:
 	if len(peer.queue.staged) == 0 || !peer.device.isUp() {
@@ -623,19 +604,7 @@ top:
 				goto top
 			}
 
-			// add to parallel and sequential queue
-			if peer.isRunning.Load() {
-				elemsContainer.filling.Add(1)
-				peer.queue.outbound.c <- elemsContainer
-				peer.device.queue.encryption.c <- elemsContainer
-			} else {
-				peer.queuedOutboundPackets.Add(-int32(len(elemsContainer.elems)))
-				for _, elem := range elemsContainer.elems {
-					peer.device.PutOutboundBuffer(elem.buffer)
-					peer.device.PutOutboundElement(elem)
-				}
-				peer.device.PutOutboundElementsContainer(elemsContainer)
-			}
+			peer.queueOutboundIfRunning(elemsContainer)
 
 			if elemsContainerOOO != nil {
 				goto top
@@ -727,16 +696,13 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	device := peer.device
 	defer func() {
 		defer device.log.Verbosef("%v - Routine: sequential sender - stopped", peer)
-		peer.stopping.Done()
+		peer.runningState.queueReaders.Done()
 	}()
 	device.log.Verbosef("%v - Routine: sequential sender - started", peer)
 
 	bufs := make([][]byte, 0, max(maxBatchSize, conn.IdealBatchSize))
 
-	for elemsContainer := range peer.queue.outbound.c {
-		if elemsContainer == nil {
-			return
-		}
+	for elemsContainer := range peer.queue.outbound {
 		peer.processOutboundContainer(elemsContainer, bufs[:0])
 	}
 }
@@ -766,7 +732,7 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 	// sole owner of the container until Put hands it back to the pool.
 	elemsContainer.filling.Wait()
 
-	if !peer.isRunning.Load() {
+	if !peer.runningState.isRunning.Load() {
 		// peer has been stopped; return re-usable elems to the shared pool.
 		// This is an optimization only. It is possible for the peer to be stopped
 		// immediately after this check, in which case, elem will get processed.
