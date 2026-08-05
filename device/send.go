@@ -403,8 +403,51 @@ func (device *Device) RoutineReadFromTUN() {
 // each), so without this cap a flood is buffered instead of dropped.
 const maxQueuedInputPackets = 2048
 
+func (device *Device) inputPacketPeer(destination []byte, packetSlices [][]byte) *Peer {
+	var src, dst netip.Addr
+	switch len(destination) {
+	case net.IPv4len:
+		dst = netip.AddrFrom4([4]byte(destination))
+		var srcBytes [net.IPv4len]byte
+		if !gatherPacketBytes(packetSlices, IPv4offsetSrc, srcBytes[:]) {
+			return nil
+		}
+		src = netip.AddrFrom4(srcBytes)
+	case net.IPv6len:
+		dst = netip.AddrFrom16([16]byte(destination))
+		var srcBytes [net.IPv6len]byte
+		if !gatherPacketBytes(packetSlices, IPv6offsetSrc, srcBytes[:]) {
+			return nil
+		}
+		src = netip.AddrFrom16(srcBytes)
+	default:
+		return nil
+	}
+	var ipPkt []byte
+	if len(packetSlices) == 1 {
+		ipPkt = packetSlices[0]
+	}
+	return device.allowedips.LookupFromPacket(src, dst, ipPkt)
+}
+
+func gatherPacketBytes(packetSlices [][]byte, offset int, destination []byte) bool {
+	for _, packetSlice := range packetSlices {
+		if offset >= len(packetSlice) {
+			offset -= len(packetSlice)
+			continue
+		}
+		n := copy(destination, packetSlice[offset:])
+		destination = destination[n:]
+		offset = 0
+		if len(destination) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (device *Device) InputPacket(destination []byte, packetSlices [][]byte) {
-	peer := device.allowedips.Lookup(destination)
+	peer := device.inputPacketPeer(destination, packetSlices)
 	if peer == nil {
 		return
 	}
@@ -447,10 +490,9 @@ type InputPacketRef struct {
 
 func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef {
 	var unmatched []*InputPacketRef
-	batchSize := device.BatchSize()
 	elemsByPeer := make(map[*Peer][]*QueueOutboundElementsContainer, len(packets))
 	for _, packetRef := range packets {
-		peer := device.allowedips.Lookup(packetRef.Destination)
+		peer := device.inputPacketPeer(packetRef.Destination, packetRef.PacketSlices)
 		if peer == nil {
 			unmatched = append(unmatched, packetRef)
 			continue
@@ -476,7 +518,7 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 		}
 		elem.packet = packet[:n]
 		containers := elemsByPeer[peer]
-		if len(containers) == 0 || len(containers[len(containers)-1].elems) >= batchSize {
+		if len(containers) == 0 || len(containers[len(containers)-1].elems) >= conn.IdealBatchSize {
 			containers = append(containers, device.GetOutboundElementsContainer())
 			elemsByPeer[peer] = containers
 		}
@@ -678,7 +720,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	}()
 	device.log.Verbosef("%v - Routine: sequential sender - started", peer)
 
-	bufs := make([][]byte, 0, maxBatchSize)
+	bufs := make([][]byte, 0, max(maxBatchSize, conn.IdealBatchSize))
 
 	for elemsContainer := range peer.queue.outbound.c {
 		if elemsContainer == nil {
