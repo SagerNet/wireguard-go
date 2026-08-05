@@ -447,6 +447,7 @@ type InputPacketRef struct {
 
 func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef {
 	var unmatched []*InputPacketRef
+	batchSize := device.BatchSize()
 	elemsByPeer := make(map[*Peer][]*QueueOutboundElementsContainer, len(packets))
 	for _, packetRef := range packets {
 		peer := device.allowedips.Lookup(packetRef.Destination)
@@ -475,7 +476,7 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 		}
 		elem.packet = packet[:n]
 		containers := elemsByPeer[peer]
-		if len(containers) == 0 || len(containers[len(containers)-1].elems) >= conn.IdealBatchSize {
+		if len(containers) == 0 || len(containers[len(containers)-1].elems) >= batchSize {
 			containers = append(containers, device.GetOutboundElementsContainer())
 			elemsByPeer[peer] = containers
 		}
