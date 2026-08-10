@@ -39,6 +39,7 @@ var _ Bind = (*StdNetBind)(nil)
 type StdNetBind struct {
 	externalControl     control.Func
 	egressProvider      EgressProvider
+	reservedAccess      sync.RWMutex
 	reservedForEndpoint map[netip.AddrPort][3]uint8
 
 	mu            sync.Mutex // protects all fields except as specified
@@ -485,10 +486,12 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint, offset int) error {
 		retried bool
 		err     error
 	)
-	for _, buf := range bufs {
-		if len(buf) > offset+3 {
-			reserved, loaded := s.reservedForEndpoint[standardEndpoint.AddrPort]
-			if loaded {
+	s.reservedAccess.RLock()
+	reserved, reservedLoaded := s.reservedForEndpoint[standardEndpoint.AddrPort]
+	s.reservedAccess.RUnlock()
+	if reservedLoaded {
+		for _, buf := range bufs {
+			if len(buf) > offset+3 {
 				copy(buf[offset+1:offset+4], reserved[:])
 			}
 		}
@@ -536,7 +539,9 @@ retry:
 }
 
 func (s *StdNetBind) SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) {
+	s.reservedAccess.Lock()
 	s.reservedForEndpoint[destination] = reserved
+	s.reservedAccess.Unlock()
 }
 
 func (s *StdNetBind) send(conn *net.UDPConn, pc batchWriter, msgs []ipv6.Message) error {

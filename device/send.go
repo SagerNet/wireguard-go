@@ -193,6 +193,8 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
+	candidates := peer.resolveEndpoints()
+
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
@@ -207,7 +209,11 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	err = peer.SendBuffers([][]byte{buf})
+	if len(candidates) > 0 {
+		err = peer.sendHandshakeBuffers([][]byte{buf}, candidates)
+	} else {
+		err = peer.SendBuffers([][]byte{buf})
+	}
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
 	}

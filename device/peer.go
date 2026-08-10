@@ -44,6 +44,8 @@ type Peer struct {
 	endpoint struct {
 		sync.Mutex
 		val            conn.Endpoint
+		candidates     []conn.Endpoint
+		resolver       func() ([]conn.Endpoint, error)
 		clearSrcOnTx   bool // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
 	}
@@ -399,6 +401,92 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	}
 	peer.endpoint.clearSrcOnTx = false
 	peer.endpoint.val = endpoint
+}
+
+// SetEndpointResolver sets a function providing the candidate endpoints for
+// this peer. It is invoked on every handshake initiation, and the initiation
+// is sent to the current endpoint and every candidate; the source of the
+// first valid reply becomes the current endpoint via roaming. When the
+// resolver fails, the candidates from its last successful invocation are
+// reused.
+func (peer *Peer) SetEndpointResolver(resolver func() ([]conn.Endpoint, error)) {
+	peer.endpoint.Lock()
+	defer peer.endpoint.Unlock()
+	peer.endpoint.resolver = resolver
+}
+
+func (peer *Peer) resolveEndpoints() []conn.Endpoint {
+	peer.endpoint.Lock()
+	resolver := peer.endpoint.resolver
+	peer.endpoint.Unlock()
+	if resolver == nil {
+		return nil
+	}
+	resolved, err := resolver()
+	peer.endpoint.Lock()
+	defer peer.endpoint.Unlock()
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to resolve endpoints: %v", peer, err)
+	} else if len(resolved) > 0 {
+		peer.endpoint.candidates = resolved
+	}
+	return peer.endpoint.candidates
+}
+
+// sendHandshakeBuffers sends buffers to the peer's current endpoint and every
+// candidate. It succeeds when at least one endpoint accepted the send.
+func (peer *Peer) sendHandshakeBuffers(buffers [][]byte, candidates []conn.Endpoint) error {
+	peer.device.net.RLock()
+	defer peer.device.net.RUnlock()
+
+	if peer.device.isClosed() {
+		return nil
+	}
+
+	peer.endpoint.Lock()
+	current := peer.endpoint.val
+	if current != nil && peer.endpoint.clearSrcOnTx {
+		current.ClearSrc()
+		peer.endpoint.clearSrcOnTx = false
+	}
+	peer.endpoint.Unlock()
+
+	endpoints := make([]conn.Endpoint, 0, len(candidates)+1)
+	if current != nil {
+		endpoints = append(endpoints, current)
+	}
+	for _, candidate := range candidates {
+		duplicate := slices.ContainsFunc(endpoints, func(endpoint conn.Endpoint) bool {
+			return endpoint.DstToString() == candidate.DstToString()
+		})
+		if !duplicate {
+			endpoints = append(endpoints, candidate)
+		}
+	}
+	if len(endpoints) == 0 {
+		return errors.New("no known endpoint for peer")
+	}
+
+	var totalLen uint64
+	for _, buffer := range buffers {
+		totalLen += uint64(len(buffer))
+	}
+
+	var firstErr error
+	sent := false
+	for _, endpoint := range endpoints {
+		err := peer.device.net.bind.Send(buffers, endpoint, MessageEncapsulatingTransportSize)
+		if err == nil {
+			sent = true
+			peer.txBytes.Add(totalLen)
+		} else if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if sent {
+		return nil
+	}
+	return firstErr
 }
 
 func (peer *Peer) markEndpointSrcForClearing() {

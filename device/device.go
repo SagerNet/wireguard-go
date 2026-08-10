@@ -359,6 +359,11 @@ func (device *Device) BatchSize() int {
 	return size
 }
 
+// AllowedIPs returns the device's allowed IPs routing table.
+func (device *Device) AllowedIPs() *AllowedIPs {
+	return &device.allowedips
+}
+
 // LookupPeer looks up a peer by its public key.
 //
 // If the peer does not exist and a [PeerLookupFunc] is set (via
