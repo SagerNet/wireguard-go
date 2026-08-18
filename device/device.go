@@ -83,9 +83,10 @@ type Device struct {
 	pool struct {
 		inboundElementsContainer  *sync.Pool
 		outboundElementsContainer *sync.Pool
-		messageBuffers            *WaitPool
 		inboundElements           *sync.Pool
 		outboundElements          *sync.Pool
+		packetBufs                *WaitPool
+		inputPacketBufs           *sync.Pool
 	}
 
 	queue struct {

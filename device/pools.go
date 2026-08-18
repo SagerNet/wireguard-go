@@ -57,14 +57,27 @@ func (device *Device) PopulatePools() {
 		s := make([]*QueueOutboundElement, 0, device.BatchSize())
 		return &QueueOutboundElementsContainer{elems: s}
 	}}
-	device.pool.messageBuffers = NewWaitPool(device.config.preallocatedBuffersPerPool, func() any {
-		return new([MaxMessageSize]byte)
-	})
 	device.pool.inboundElements = &sync.Pool{New: func() any {
 		return new(QueueInboundElement)
 	}}
 	device.pool.outboundElements = &sync.Pool{New: func() any {
 		return new(QueueOutboundElement)
+	}}
+	packetBufSize := singlePacketSlabSize
+	if device.BatchSize() > 1 {
+		packetBufSize = batchingSlabSize
+	}
+	device.pool.packetBufs = NewWaitPool(device.config.preallocatedBuffersPerPool, func() any {
+		return newPacketBuf(packetBufSize, func(buf *packetBuf) {
+			device.pool.packetBufs.Put(buf)
+		})
+	})
+	device.pool.inputPacketBufs = &sync.Pool{New: func() any {
+		return &packetBuf{cleanup: func(packetBuffer *packetBuf) {
+			_ = buf.Put(packetBuffer.slab)
+			packetBuffer.slab = nil
+			device.pool.inputPacketBufs.Put(packetBuffer)
+		}}
 	}}
 }
 
@@ -94,26 +107,22 @@ func (device *Device) PutOutboundElementsContainer(c *QueueOutboundElementsConta
 	device.pool.outboundElementsContainer.Put(c)
 }
 
-func (device *Device) GetMessageBuffer() *[MaxMessageSize]byte {
-	return device.pool.messageBuffers.Get().(*[MaxMessageSize]byte)
+func (device *Device) getPacketBuf() *packetBuf {
+	b := device.pool.packetBufs.Get().(*packetBuf)
+	b.incRef()
+	return b
 }
 
-func (device *Device) PutMessageBuffer(msg *[MaxMessageSize]byte) {
-	device.pool.messageBuffers.Put(msg)
-}
-
-// Outbound buffers come from the sing allocator instead of the bounded
-// messageBuffers pool: the injection paths (InputPacket/InputPackets) run on
-// the caller's shared read loop, which must never block on pool exhaustion,
-// and their packets are far smaller than MaxMessageSize, so they are allocated
-// by actual size. This also keeps the bounded pool exclusively for the receive
-// path, so outbound backlog can no longer starve it.
-func (device *Device) GetOutboundBuffer(size int) []byte {
-	return buf.Get(size)
-}
-
-func (device *Device) PutOutboundBuffer(buffer []byte) {
-	_ = buf.Put(buffer)
+// Input packet buffers come from the sing allocator instead of the bounded
+// packetBufs pool: the injection paths (InputPacket/InputPackets) run on the
+// caller's shared read loop, which must never block on pool exhaustion, and
+// their packets are far smaller than a packetBuf slab, so they are allocated by
+// actual size.
+func (device *Device) getInputPacketBuf(size int) *packetBuf {
+	b := device.pool.inputPacketBufs.Get().(*packetBuf)
+	b.slab = buf.Get(size)
+	b.incRef()
+	return b
 }
 
 func (device *Device) GetInboundElement() *QueueInboundElement {
@@ -121,15 +130,25 @@ func (device *Device) GetInboundElement() *QueueInboundElement {
 }
 
 func (device *Device) PutInboundElement(elem *QueueInboundElement) {
+	elem.buffer.decRef()
 	elem.clearPointers()
 	device.pool.inboundElements.Put(elem)
 }
 
+// GetOutboundElement returns a [*QueueOutboundElement] with all its fields
+// set to their respective zero values.
 func (device *Device) GetOutboundElement() *QueueOutboundElement {
-	return device.pool.outboundElements.Get().(*QueueOutboundElement)
+	elem := device.pool.outboundElements.Get().(*QueueOutboundElement)
+	elem.plaintextOffset = 0
+	elem.nonce = 0
+	// buffer, packet, keypair, and peer were cleared (if necessary) by [QueueOutboundElement.clearPointers].
+	return elem
 }
 
 func (device *Device) PutOutboundElement(elem *QueueOutboundElement) {
+	if elem.buffer != nil {
+		elem.buffer.decRef()
+	}
 	elem.clearPointers()
 	device.pool.outboundElements.Put(elem)
 }

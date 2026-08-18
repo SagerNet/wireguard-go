@@ -21,18 +21,18 @@ import (
 )
 
 type QueueHandshakeElement struct {
-	msgType  uint32
-	packet   []byte
-	endpoint conn.Endpoint
-	buffer   *[MaxMessageSize]byte
+	msgType    uint32
+	packet     []byte
+	packetMeta conn.ReceivedPacket
+	buffer     *packetBuf
 }
 
 type QueueInboundElement struct {
-	buffer   *[MaxMessageSize]byte
-	packet   []byte
-	counter  uint64
-	keypair  *Keypair
-	endpoint conn.Endpoint
+	buffer     *packetBuf
+	packet     []byte
+	packetMeta conn.ReceivedPacket
+	counter    uint64
+	keypair    *Keypair
 }
 
 type QueueInboundElementsContainer struct {
@@ -52,8 +52,8 @@ type QueueInboundElementsContainer struct {
 func (elem *QueueInboundElement) clearPointers() {
 	elem.buffer = nil
 	elem.packet = nil
+	elem.packetMeta = conn.ReceivedPacket{}
 	elem.keypair = nil
-	elem.endpoint = nil
 }
 
 /* Called when a new authenticated message has been received
@@ -90,31 +90,29 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 	// receive datagrams until conn is closed
 
 	var (
-		bufsArrs    = make([]*[MaxMessageSize]byte, maxBatchSize)
-		bufs        = make([][]byte, maxBatchSize)
+		packets = make([]conn.ReceivedPacket, maxBatchSize)
+		buf     = device.getPacketBuf()
+		// bufDirty tracks whether the current buf has been pushed downstream to
+		// crypto and per-peer/handshake functions, or can be re-used across the
+		// next read cycle
+		bufDirty    bool
 		err         error
-		sizes       = make([]int, maxBatchSize)
 		count       int
-		endpoints   = make([]conn.Endpoint, maxBatchSize)
 		deathSpiral int
 		elemsByPeer = make(map[*Peer]*QueueInboundElementsContainer, maxBatchSize)
 	)
 
-	for i := range bufsArrs {
-		bufsArrs[i] = device.GetMessageBuffer()
-		bufs[i] = bufsArrs[i][:]
-	}
-
 	defer func() {
-		for i := 0; i < maxBatchSize; i++ {
-			if bufsArrs[i] != nil {
-				device.PutMessageBuffer(bufsArrs[i])
-			}
-		}
+		buf.decRef()
 	}()
 
 	for {
-		count, err = recv(bufs, sizes, endpoints)
+		if bufDirty {
+			buf.decRef()
+			buf = device.getPacketBuf()
+			bufDirty = false
+		}
+		count, err = recv(buf.slab, packets)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -137,14 +135,14 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 		deathSpiral = 0
 
 		// handle each packet in the batch
-		for i, size := range sizes[:count] {
-			if size < MinMessageSize {
+		for _, meta := range packets[:count] {
+			if meta.Size < MinMessageSize {
 				continue
 			}
 
 			// check size of packet
 
-			packet := bufsArrs[i][:size]
+			packet := meta.Bytes(buf.slab)
 			msgType := binary.LittleEndian.Uint32(packet[:4])
 
 			switch msgType {
@@ -179,10 +177,12 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				// create work element
 				peer := value.peer
 				elem := device.GetInboundElement()
+				bufDirty = true
+				buf.incRef()
+				elem.buffer = buf
 				elem.packet = packet
-				elem.buffer = bufsArrs[i]
+				elem.packetMeta = meta
 				elem.keypair = keypair
-				elem.endpoint = endpoints[i]
 				elem.counter = 0
 
 				elemsForPeer, ok := elemsByPeer[peer]
@@ -191,8 +191,6 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					elemsByPeer[peer] = elemsForPeer
 				}
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
 				continue
 
 			// otherwise it is a fixed size & handshake related packet
@@ -217,16 +215,17 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				continue
 			}
 
+			buf.incRef()
 			select {
 			case device.queue.handshake.c <- QueueHandshakeElement{
-				msgType:  msgType,
-				buffer:   bufsArrs[i],
-				packet:   packet,
-				endpoint: endpoints[i],
+				msgType:    msgType,
+				buffer:     buf,
+				packet:     packet,
+				packetMeta: meta,
 			}:
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
+				bufDirty = true
 			default:
+				buf.decRef()
 			}
 		}
 		for peer, elemsContainer := range elemsByPeer {
@@ -304,7 +303,7 @@ func (device *Device) RoutineHandshake(id int) {
 			// consume reply
 
 			if peer := entry.peer; peer.runningState.isRunning.Load() {
-				device.log.Verbosef("Receiving cookie response from %s", elem.endpoint.DstToString())
+				device.log.Verbosef("Receiving cookie response from %s", elem.packetMeta.Endpoint.DstToString())
 				if !peer.cookieGenerator.ConsumeReply(&reply) {
 					device.log.Verbosef("Could not decrypt invalid cookie response")
 				}
@@ -327,14 +326,14 @@ func (device *Device) RoutineHandshake(id int) {
 
 				// verify MAC2 field
 
-				if !device.cookieChecker.CheckMAC2(elem.packet, elem.endpoint.DstToBytes()) {
+				if !device.cookieChecker.CheckMAC2(elem.packet, elem.packetMeta.Endpoint.DstToBytes()) {
 					device.SendHandshakeCookie(&elem)
 					goto skip
 				}
 
 				// check ratelimiter
 
-				if !device.rate.limiter.Allow(elem.endpoint.DstIP()) {
+				if !device.rate.limiter.Allow(elem.packetMeta.Endpoint.DstIP()) {
 					goto skip
 				}
 			}
@@ -360,9 +359,9 @@ func (device *Device) RoutineHandshake(id int) {
 
 			// consume initiation
 
-			peer := device.ConsumeMessageInitiation(&msg, elem.endpoint)
+			peer := device.ConsumeMessageInitiation(&msg, elem.packetMeta.Endpoint)
 			if peer == nil {
-				device.log.Verbosef("Received invalid initiation message from %s", elem.endpoint.DstToString())
+				device.log.Verbosef("Received invalid initiation message from %s", elem.packetMeta.Endpoint.DstToString())
 				goto skip
 			}
 
@@ -372,7 +371,7 @@ func (device *Device) RoutineHandshake(id int) {
 			peer.timersAnyAuthenticatedPacketReceived()
 
 			// update endpoint
-			peer.SetEndpointFromPacket(elem.endpoint)
+			peer.SetEndpointFromPacket(elem.packetMeta.Endpoint)
 
 			device.log.Verbosef("%v - Received handshake initiation", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
@@ -394,12 +393,12 @@ func (device *Device) RoutineHandshake(id int) {
 
 			peer := device.ConsumeMessageResponse(&msg)
 			if peer == nil {
-				device.log.Verbosef("Received invalid response message from %s", elem.endpoint.DstToString())
+				device.log.Verbosef("Received invalid response message from %s", elem.packetMeta.Endpoint.DstToString())
 				goto skip
 			}
 
 			// update endpoint
-			peer.SetEndpointFromPacket(elem.endpoint)
+			peer.SetEndpointFromPacket(elem.packetMeta.Endpoint)
 
 			device.log.Verbosef("%v - Received handshake response", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
@@ -423,7 +422,7 @@ func (device *Device) RoutineHandshake(id int) {
 			peer.SendKeepalive()
 		}
 	skip:
-		device.PutMessageBuffer(elem.buffer)
+		elem.buffer.decRef()
 	}
 }
 
@@ -483,12 +482,12 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
 
 		validTailPacket = i
 		if peer.ReceivedWithKeypair(elem.keypair) {
-			peer.SetEndpointFromPacket(elem.endpoint)
+			peer.SetEndpointFromPacket(elem.packetMeta.Endpoint)
 			peer.timersHandshakeComplete()
 			peer.SendPriorityMessage()
 			peer.SendStagedPackets()
 		}
-		if ep, ok := elem.endpoint.(conn.PeerAwareEndpoint); ok {
+		if ep, ok := elem.packetMeta.Endpoint.(conn.PeerAwareEndpoint); ok {
 			ep.FromPeer(peer.handshake.remoteStatic)
 		}
 		rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
@@ -540,12 +539,13 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
 			continue
 		}
 
-		scratch = append(scratch, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
+		elem.packetMeta.Size = MessageTransportOffsetContent + len(elem.packet)
+		scratch = append(scratch, elem.packetMeta.Bytes(elem.buffer.slab))
 	}
 
 	peer.rxBytes.Add(rxBytesLen)
 	if validTailPacket >= 0 {
-		peer.SetEndpointFromPacket(elems[validTailPacket].endpoint)
+		peer.SetEndpointFromPacket(elems[validTailPacket].packetMeta.Endpoint)
 		peer.keepKeyFreshReceiving()
 		peer.timersAnyAuthenticatedPacketTraversal()
 		peer.timersAnyAuthenticatedPacketReceived()
@@ -560,7 +560,6 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
 		}
 	}
 	for _, elem := range elems {
-		device.PutMessageBuffer(elem.buffer)
 		device.PutInboundElement(elem)
 	}
 }

@@ -276,10 +276,11 @@ type testTUN struct {
 
 func (t *testTUN) File() *os.File { return nil }
 
-func (t *testTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+func (t *testTUN) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
 	select {
 	case packet := <-t.inbound:
-		sizes[0] = copy(bufs[0][offset:], packet)
+		packets[0].Offset = tun.ReadPacketSpacing
+		packets[0].Size = copy(slab[tun.ReadPacketSpacing:len(slab)-tun.ReadPacketSpacing], packet)
 		return 1, nil
 	case <-t.done:
 		return 0, os.ErrClosed

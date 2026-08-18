@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -457,27 +456,31 @@ retry:
 	return n, &ep, nil
 }
 
-func (bind *WinRingBind) receiveIPv4(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
+func (bind *WinRingBind) receiveIPv4(slab []byte, packets []ReceivedPacket) (int, error) {
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
-	n, ep, err := bind.v4.Receive(bufs[0], &bind.isOpen)
+	n, ep, err := bind.v4.Receive(slab, &bind.isOpen)
 	if n > 3 {
-		common.ClearArray(bufs[0][1:4])
+		clear(slab[1:4])
 	}
-	sizes[0] = n
-	eps[0] = ep
+	packets[0] = ReceivedPacket{
+		Size:     n,
+		Endpoint: ep,
+	}
 	return 1, err
 }
 
-func (bind *WinRingBind) receiveIPv6(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
+func (bind *WinRingBind) receiveIPv6(slab []byte, packets []ReceivedPacket) (int, error) {
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
-	n, ep, err := bind.v6.Receive(bufs[0], &bind.isOpen)
+	n, ep, err := bind.v6.Receive(slab, &bind.isOpen)
 	if n > 3 {
-		common.ClearArray(bufs[0][1:4])
+		clear(slab[1:4])
 	}
-	sizes[0] = n
-	eps[0] = ep
+	packets[0] = ReceivedPacket{
+		Size:     n,
+		Endpoint: ep,
+	}
 	return 1, err
 }
 
