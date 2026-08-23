@@ -39,6 +39,8 @@ var _ Bind = (*StdNetBind)(nil)
 type StdNetBind struct {
 	externalControl     control.Func
 	egressProvider      EgressProvider
+	onRead              func(size int)
+	onWrite             func(size int)
 	reservedAccess      sync.RWMutex
 	reservedForEndpoint map[netip.AddrPort][3]uint8
 
@@ -280,12 +282,31 @@ again:
 			return 1, nil
 		})
 	}
+	if s.onRead != nil {
+		for i, receiveFunc := range fns {
+			fns[i] = func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
+				count, err := receiveFunc(bufs, sizes, endpoints)
+				if count > 0 {
+					s.onRead(sizes[0])
+				}
+				return count, err
+			}
+		}
+	}
 
 	return fns, uint16(port), nil
 }
 
 func (s *StdNetBind) SetEgressProvider(provider EgressProvider) {
 	s.egressProvider = provider
+}
+
+// SetIOActivityFuncs sets callbacks invoked once per receive and send syscall batch:
+// onRead with the size of the first packet of a received batch, onWrite with the size of
+// the first packet of a sent batch. Call it before Open.
+func (s *StdNetBind) SetIOActivityFuncs(onRead func(size int), onWrite func(size int)) {
+	s.onRead = onRead
+	s.onWrite = onWrite
 }
 
 func (s *StdNetBind) putMessages(msgs *[]ipv6.Message) {
@@ -444,6 +465,9 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint, offset int) error {
 			return err
 		}
 		bufs = bufs[IdealBatchSize:]
+	}
+	if s.onWrite != nil && len(bufs) > 0 {
+		s.onWrite(len(bufs[0]) - offset)
 	}
 	standardEndpoint := endpoint.(*StdNetEndpoint)
 	s.mu.Lock()
