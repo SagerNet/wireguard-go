@@ -50,6 +50,7 @@ type Device struct {
 		port          uint16 // listening port
 		fwmark        uint32 // mark value (0 = disabled)
 		brokenRoaming bool
+		rebindPending atomic.Bool
 	}
 
 	staticIdentity struct {
@@ -699,6 +700,22 @@ func (device *Device) BindSetMark(mark uint32) error {
 	device.peers.RUnlock()
 
 	return nil
+}
+
+// scheduleBindUpdate reopens the bind from a new goroutine: the send and
+// receive paths that report conn.ErrRebindRequired run under the net read
+// lock or are waited for by closeBindLocked.
+func (device *Device) scheduleBindUpdate() {
+	if !device.net.rebindPending.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer device.net.rebindPending.Store(false)
+		err := device.BindUpdate()
+		if err != nil {
+			device.log.Errorf("Failed to reopen bind: %v", err)
+		}
+	}()
 }
 
 func (device *Device) BindUpdate() error {

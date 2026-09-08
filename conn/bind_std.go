@@ -584,10 +584,7 @@ func (s *StdNetBind) send(conn *net.UDPConn, pc batchWriter, msgs []ipv6.Message
 		}
 	} else {
 		if supportsMsgX {
-			handled, sendErr := s.sendMsgX(conn, msgs)
-			if handled {
-				return sendErr
-			}
+			return s.sendMsgX(conn, msgs)
 		}
 		for _, msg := range msgs {
 			_, _, err = conn.WriteMsgUDP(msg.Buffers[0], msg.OOB, msg.Addr.(*net.UDPAddr))

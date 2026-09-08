@@ -120,6 +120,10 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				return
 			}
 			device.log.Verbosef("Failed to receive %s packet: %v", recvName, err)
+			if errors.Is(err, conn.ErrRebindRequired) {
+				device.scheduleBindUpdate()
+				return
+			}
 			if neterr, ok := err.(net.Error); ok && !neterr.Temporary() {
 				return
 			}
