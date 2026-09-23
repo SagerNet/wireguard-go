@@ -116,6 +116,7 @@ type config struct {
 	queueInboundSize           int
 	queueHandshakeSize         int
 	preallocatedBuffersPerPool uint32
+	metrics                    Metrics
 }
 
 func defaultConfig() config {
@@ -180,6 +181,64 @@ func WithQueueHandshakeSize(size int) Option {
 func WithPreallocatedBuffersPerPool(size uint32) Option {
 	return optionFunc(func(config *config) {
 		config.preallocatedBuffersPerPool = size
+	})
+}
+
+// Counter is a monotonically increasing counter used in [Metrics].
+type Counter interface {
+	// Add increments the Counter's value by n. n must not be negative. Add is
+	// called in performance-sensitive contexts, therefore it must be cheap. Add
+	// may be called concurrently.
+	Add(n int64)
+}
+
+// Metrics contains metrics that can be exported via [WithMetrics].
+type Metrics struct {
+	// MessageInitiationTXAttemptInitial counts non-retry handshake
+	// initiation messages passed to the network send path.
+	MessageInitiationTXAttemptInitial Counter
+	// MessageInitiationTXAttemptRetry counts retry handshake initiation
+	// messages passed to the network send path.
+	MessageInitiationTXAttemptRetry Counter
+	// MessageResponseTXAttempt counts handshake response messages passed to the
+	// network send path.
+	MessageResponseTXAttempt Counter
+	// HandshakeInitiatorCompleted counts symmetric session establishment on the
+	// initiator side.
+	HandshakeInitiatorCompleted Counter
+	// HandshakeResponderCompleted counts responder-side handshake completions,
+	// observed when an authenticated transport packet confirms the new keypair.
+	HandshakeResponderCompleted Counter
+}
+
+// noopCounter is a noop implementation of [Counter].
+type noopCounter struct {
+}
+
+func (noopCounter) Add(int64) {}
+
+func (m *Metrics) fillNils() {
+	if m.MessageInitiationTXAttemptInitial == nil {
+		m.MessageInitiationTXAttemptInitial = noopCounter{}
+	}
+	if m.MessageInitiationTXAttemptRetry == nil {
+		m.MessageInitiationTXAttemptRetry = noopCounter{}
+	}
+	if m.MessageResponseTXAttempt == nil {
+		m.MessageResponseTXAttempt = noopCounter{}
+	}
+	if m.HandshakeInitiatorCompleted == nil {
+		m.HandshakeInitiatorCompleted = noopCounter{}
+	}
+	if m.HandshakeResponderCompleted == nil {
+		m.HandshakeResponderCompleted = noopCounter{}
+	}
+}
+
+// WithMetrics sets the provided [Metrics] to be used at instrumentation points.
+func WithMetrics(metrics Metrics) Option {
+	return optionFunc(func(config *config) {
+		config.metrics = metrics
 	})
 }
 
@@ -388,6 +447,7 @@ func NewDevice(ctx context.Context, tunDevice tun.Device, bind conn.Bind, logger
 	for _, opt := range opts {
 		opt.apply(&device.config)
 	}
+	device.config.metrics.fillNils()
 	device.pauseManager = service.FromContext[pause.Manager](ctx)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
