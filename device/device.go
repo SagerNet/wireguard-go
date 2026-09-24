@@ -209,6 +209,9 @@ type Metrics struct {
 	// MessageResponseTXAttempt counts handshake response messages passed to the
 	// network send path.
 	MessageResponseTXAttempt Counter
+	// MessageCookieReplyTXAttempt counts cookie reply messages passed to the
+	// network send path.
+	MessageCookieReplyTXAttempt Counter
 	// HandshakeInitiatorCompleted counts symmetric session establishment on the
 	// initiator side.
 	HandshakeInitiatorCompleted Counter
@@ -232,6 +235,9 @@ func (m *Metrics) fillNils() {
 	}
 	if m.MessageResponseTXAttempt == nil {
 		m.MessageResponseTXAttempt = noopCounter{}
+	}
+	if m.MessageCookieReplyTXAttempt == nil {
+		m.MessageCookieReplyTXAttempt = noopCounter{}
 	}
 	if m.HandshakeInitiatorCompleted == nil {
 		m.HandshakeInitiatorCompleted = noopCounter{}
