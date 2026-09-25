@@ -33,7 +33,12 @@ type Peer struct {
 		sessionExpires time.Time
 	}
 
-	queuedOutboundPackets atomic.Int32 // packets in staged+outbound queues, for input backpressure
+	stagedPackets         atomic.Int32
+	queuedOutboundPackets atomic.Int32
+	outboundSpace         struct {
+		sync.Mutex
+		ready chan struct{}
+	}
 
 	// deleteOnIdle indicates whether the peer should be deleted when idle
 	// because it was auto-created via a Device.PeerLookupFunc.
@@ -344,6 +349,7 @@ func (peer *Peer) Stop() {
 	if !peer.isRunning.Swap(false) {
 		return
 	}
+	peer.wakeOutboundWaiters()
 
 	peer.device.log.Verbosef("%v - Stopping", peer)
 
