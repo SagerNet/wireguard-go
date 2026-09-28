@@ -149,6 +149,8 @@ func (peer *Peer) SendPriorityMessage() {
 	elem.packet = buf.slab[offset : offset+n]
 	elem.plaintextOffset = offset
 	elem.peer = peer
+	peer.queue.nonceMu.Lock()
+	defer peer.queue.nonceMu.Unlock()
 	elem.nonce = keypair.sendNonce.Add(1) - 1
 	if elem.nonce >= RejectAfterMessages {
 		keypair.sendNonce.Store(RejectAfterMessages)
@@ -593,6 +595,11 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 	return unmatched
 }
 
+// StagePackets attempts to enqueue elements into the peer's staging queue.
+// If the queue is full, its oldest member is dropped to make room.
+// If the peer is not running, the data is quietly dropped.
+//
+// [Peer.nonceMu] relies on this function being non-blocking.
 func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
 	if running := peer.doIfRunning(func() {
 		peer.queuedOutboundPackets.Add(int32(len(elems.elems)))
@@ -622,13 +629,22 @@ func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
 
 // SendStagedPackets sends any staged packets to Peer.
 func (peer *Peer) SendStagedPackets() {
+	// SendStagedPackets may be called concurrently. Serialize nonce assignment
+	// with outbound enqueue so packets are transmitted in nonce order; excessive
+	// reordering can cause the receiver's replay filter to drop packets.
+	//
+	// Unlock explicitly before each return to avoid holding nonceMu across
+	// SendHandshakeInitiation, whose expensive work would stall TUN readers.
+	peer.queue.nonceMu.Lock()
 top:
 	if len(peer.queue.staged) == 0 || !peer.device.isUp() {
+		peer.queue.nonceMu.Unlock()
 		return
 	}
 
 	keypair := peer.keypairs.Current()
 	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || sinceIncludingSleep(keypair.created) >= RejectAfterTime {
+		peer.queue.nonceMu.Unlock()
 		peer.SendHandshakeInitiation(false)
 		return
 	}
@@ -674,6 +690,7 @@ top:
 				goto top
 			}
 		default:
+			peer.queue.nonceMu.Unlock()
 			return
 		}
 	}
