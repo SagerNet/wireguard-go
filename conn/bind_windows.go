@@ -82,7 +82,7 @@ type WinRingBind struct {
 	isOpen atomic.Uint32 // 0, 1, or 2
 }
 
-func NewDefaultBind(externalControl control.Func) Bind {
+func NewDefaultBind(externalControl control.Func, _ ...Option) Bind {
 	return NewWinRingBind(externalControl)
 }
 
@@ -582,7 +582,11 @@ func (bind *WinRingBind) SetReservedForEndpoint(destination netip.AddrPort, rese
 func (s *StdNetBind) BindSocketToInterface4(interfaceIndex uint32, blackhole bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sysconn, err := s.ipv4.SyscallConn()
+	conn, err := firstConn(s.v4)
+	if err != nil {
+		return err
+	}
+	sysconn, err := conn.SyscallConn()
 	if err != nil {
 		return err
 	}
@@ -602,7 +606,11 @@ func (s *StdNetBind) BindSocketToInterface4(interfaceIndex uint32, blackhole boo
 func (s *StdNetBind) BindSocketToInterface6(interfaceIndex uint32, blackhole bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sysconn, err := s.ipv6.SyscallConn()
+	conn, err := firstConn(s.v6)
+	if err != nil {
+		return err
+	}
+	sysconn, err := conn.SyscallConn()
 	if err != nil {
 		return err
 	}

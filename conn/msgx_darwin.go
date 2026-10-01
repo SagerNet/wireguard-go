@@ -10,7 +10,6 @@ package conn
 import (
 	"fmt"
 	"io"
-	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -186,19 +185,9 @@ var sendMsgXPool = sync.Pool{New: func() any {
 
 // sendMsgX sends msgs with a single syscall, over a connected socket when the
 // bind has one and by addressing every message otherwise.
-func (s *StdNetBind) sendMsgX(conn *net.UDPConn, msgs []ipv6.Message) error {
-	var (
-		rawConn syscall.RawConn
-		isV6    bool
-	)
-	s.mu.Lock()
-	if conn == s.ipv6 {
-		rawConn = s.ipv6RC
-		isV6 = true
-	} else {
-		rawConn = s.ipv4RC
-	}
-	s.mu.Unlock()
+func (s *StdNetBind) sendMsgX(sock *stdNetSocket, msgs []ipv6.Message) error {
+	rawConn := sock.rc
+	isV6 := sock.isV6
 	destination := M.AddrPortFromNet(msgs[0].Addr)
 	connected, err := s.ensureConnected(rawConn, isV6, destination)
 	if err != nil {
@@ -255,11 +244,9 @@ type receiveMsgXState struct {
 	names []unix.RawSockaddrInet6
 }
 
-func (s *StdNetBind) makeReceiveMsgX(conn *net.UDPConn, isV6 bool) (ReceiveFunc, error) {
-	rawConn, err := conn.SyscallConn()
-	if err != nil {
-		return nil, err
-	}
+func (s *StdNetBind) makeReceiveMsgX(sock *stdNetSocket) ReceiveFunc {
+	rawConn := sock.rc
+	isV6 := sock.isV6
 	state := &receiveMsgXState{
 		hdrs:  make([]msghdrX, msgXBatchSize),
 		iovs:  make([]unix.Iovec, msgXBatchSize),
@@ -339,5 +326,5 @@ func (s *StdNetBind) makeReceiveMsgX(conn *net.UDPConn, isV6 bool) (ReceiveFunc,
 			packets[i].Endpoint = &StdNetEndpoint{AddrPort: addrPort}
 		}
 		return numMsgs, nil
-	}, nil
+	}
 }

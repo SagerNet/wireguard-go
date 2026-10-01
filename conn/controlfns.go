@@ -19,3 +19,7 @@ const socketBufferSize = 7 << 20
 // controlFns is a list of functions that are called from the listen config
 // that can apply socket options.
 var controlFns []control.Func
+
+// reusePortFn sets SO_REUSEPORT, or is nil on platforms that lack it.
+// See [WithSockets].
+var reusePortFn control.Func

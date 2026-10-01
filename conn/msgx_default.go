@@ -2,11 +2,7 @@
 
 package conn
 
-import (
-	"net"
-
-	"golang.org/x/net/ipv6"
-)
+import "golang.org/x/net/ipv6"
 
 const supportsMsgX = false
 
@@ -21,10 +17,10 @@ func (m *msgXState) reset() {
 func (s *StdNetBind) SetSinglePeerMode() {
 }
 
-func (s *StdNetBind) sendMsgX(conn *net.UDPConn, msgs []ipv6.Message) error {
+func (s *StdNetBind) sendMsgX(sock *stdNetSocket, msgs []ipv6.Message) error {
 	panic("sendMsgX is not supported on this platform")
 }
 
-func (s *StdNetBind) makeReceiveMsgX(conn *net.UDPConn, isV6 bool) (ReceiveFunc, error) {
+func (s *StdNetBind) makeReceiveMsgX(sock *stdNetSocket) ReceiveFunc {
 	panic("makeReceiveMsgX is not supported on this platform")
 }
