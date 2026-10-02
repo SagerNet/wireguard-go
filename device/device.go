@@ -600,7 +600,7 @@ func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 		return nil
 	}
 
-	p, err := device.NewPeer(pk)
+	p, err := device.newPeer(pk, conf, true /* deleteOnIdle */)
 	if err != nil {
 		if errors.Is(err, errAddExistingPeer) {
 			device.peers.RLock()
@@ -609,12 +609,6 @@ func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 		}
 		device.log.Errorf("Failed to create peer: %v", err)
 		return nil
-	}
-	p.SetPresharedKey(conf.PresharedKey)
-	p.SetAllowedIPs(conf.AllowedIPs)
-	p.deleteOnIdle = true
-	if conf.Endpoint != nil {
-		p.SetEndpointFromPacket(conf.Endpoint)
 	}
 	p.Start()
 	return p
