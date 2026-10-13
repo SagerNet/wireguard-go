@@ -373,11 +373,18 @@ again:
 	for i, receiveFunc := range fns {
 		fns[i] = func(slab []byte, packets []ReceivedPacket) (int, error) {
 			count, err := receiveFunc(slab, packets)
-			for _, packet := range packets[:count] {
-				if packet.Size > 3 {
-					clear(slab[packet.Offset+1 : packet.Offset+4])
+			s.reservedAccess.RLock()
+			if len(s.reservedForEndpoint) > 0 {
+				for _, packet := range packets[:count] {
+					if packet.Size > 3 {
+						source := packet.Endpoint.(*StdNetEndpoint).AddrPort
+						if _, loaded := s.reservedForEndpoint[netip.AddrPortFrom(source.Addr().Unmap(), source.Port())]; loaded {
+							clear(slab[packet.Offset+1 : packet.Offset+4])
+						}
+					}
 				}
 			}
+			s.reservedAccess.RUnlock()
 			if count > 0 && s.onRead != nil {
 				s.onRead(packets[0].Size)
 			}
@@ -608,7 +615,7 @@ func (s *StdNetBind) SendTo(flow int, bufs [][]byte, endpoint Endpoint, offset i
 		err     error
 	)
 	s.reservedAccess.RLock()
-	reserved, reservedLoaded := s.reservedForEndpoint[standardEndpoint.AddrPort]
+	reserved, reservedLoaded := s.reservedForEndpoint[netip.AddrPortFrom(standardEndpoint.Addr().Unmap(), standardEndpoint.Port())]
 	s.reservedAccess.RUnlock()
 	if reservedLoaded {
 		for _, buf := range bufs {
@@ -660,7 +667,7 @@ retry:
 
 func (s *StdNetBind) SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) {
 	s.reservedAccess.Lock()
-	s.reservedForEndpoint[destination] = reserved
+	s.reservedForEndpoint[netip.AddrPortFrom(destination.Addr().Unmap(), destination.Port())] = reserved
 	s.reservedAccess.Unlock()
 }
 

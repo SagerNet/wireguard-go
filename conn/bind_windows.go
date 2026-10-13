@@ -16,7 +16,6 @@ import (
 	"unsafe"
 
 	"github.com/sagernet/sing/common/control"
-	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/wireguard-go/conn/winrio"
 	"golang.org/x/sys/windows"
@@ -75,7 +74,8 @@ type afWinRingBind struct {
 // WinRingBind uses Windows registered I/O for fast ring buffered networking.
 type WinRingBind struct {
 	externalControl     control.Func
-	reservedForEndpoint map[WinRingEndpoint][3]uint8
+	reservedAccess      sync.RWMutex
+	reservedForEndpoint map[netip.AddrPort][3]uint8
 
 	v4, v6 afWinRingBind
 	mu     sync.RWMutex
@@ -92,7 +92,7 @@ func NewWinRingBind(externalControl control.Func) Bind {
 	}
 	return &WinRingBind{
 		externalControl:     externalControl,
-		reservedForEndpoint: make(map[WinRingEndpoint][3]uint8),
+		reservedForEndpoint: make(map[netip.AddrPort][3]uint8),
 	}
 }
 
@@ -149,6 +149,10 @@ func (e *WinRingEndpoint) DstIP() netip.Addr {
 		return netip.AddrFrom16(*(*[16]byte)(e.data[6:22]))
 	}
 	return netip.Addr{}
+}
+
+func (e *WinRingEndpoint) unmappedAddrPort() netip.AddrPort {
+	return netip.AddrPortFrom(e.DstIP().Unmap(), binary.BigEndian.Uint16(e.data[0:2]))
 }
 
 func (e *WinRingEndpoint) SrcIP() netip.Addr {
@@ -461,7 +465,12 @@ func (bind *WinRingBind) receiveIPv4(slab []byte, packets []ReceivedPacket) (int
 	defer bind.mu.RUnlock()
 	n, ep, err := bind.v4.Receive(slab, &bind.isOpen)
 	if n > 3 {
-		clear(slab[1:4])
+		bind.reservedAccess.RLock()
+		_, loaded := bind.reservedForEndpoint[ep.(*WinRingEndpoint).unmappedAddrPort()]
+		bind.reservedAccess.RUnlock()
+		if loaded {
+			clear(slab[1:4])
+		}
 	}
 	packets[0] = ReceivedPacket{
 		Size:     n,
@@ -475,7 +484,12 @@ func (bind *WinRingBind) receiveIPv6(slab []byte, packets []ReceivedPacket) (int
 	defer bind.mu.RUnlock()
 	n, ep, err := bind.v6.Receive(slab, &bind.isOpen)
 	if n > 3 {
-		clear(slab[1:4])
+		bind.reservedAccess.RLock()
+		_, loaded := bind.reservedForEndpoint[ep.(*WinRingEndpoint).unmappedAddrPort()]
+		bind.reservedAccess.RUnlock()
+		if loaded {
+			clear(slab[1:4])
+		}
 	}
 	packets[0] = ReceivedPacket{
 		Size:     n,
@@ -541,15 +555,15 @@ func (bind *WinRingBind) Send(bufs [][]byte, endpoint Endpoint, offset int) erro
 	if !ok {
 		return ErrWrongEndpointType
 	}
+	bind.reservedAccess.RLock()
+	reserved, reservedLoaded := bind.reservedForEndpoint[nend.unmappedAddrPort()]
+	bind.reservedAccess.RUnlock()
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
 	for _, buf := range bufs {
 		buf = buf[offset:]
-		if len(buf) > 3 {
-			reserved, loaded := bind.reservedForEndpoint[*endpoint.(*WinRingEndpoint)]
-			if loaded {
-				copy(buf[1:4], reserved[:])
-			}
+		if reservedLoaded && len(buf) > 3 {
+			copy(buf[1:4], reserved[:])
 		}
 		switch nend.family {
 		case windows.AF_INET:
@@ -572,11 +586,9 @@ func (bind *WinRingBind) Send(bufs [][]byte, endpoint Endpoint, offset int) erro
 }
 
 func (bind *WinRingBind) SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) {
-	endpoint, err := bind.ParseEndpoint(destination.String())
-	if err != nil {
-		panic(E.Cause(err, "parse destination as WinRingEndpoint"))
-	}
-	bind.reservedForEndpoint[*endpoint.(*WinRingEndpoint)] = reserved
+	bind.reservedAccess.Lock()
+	bind.reservedForEndpoint[netip.AddrPortFrom(destination.Addr().Unmap(), destination.Port())] = reserved
+	bind.reservedAccess.Unlock()
 }
 
 func (s *StdNetBind) BindSocketToInterface4(interfaceIndex uint32, blackhole bool) error {
