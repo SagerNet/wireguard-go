@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"time"
 
 	"github.com/sagernet/wireguard-go/conn"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -96,7 +95,6 @@ func (device *Device) RoutineReceiveIncoming(recvName string, maxBatchSize int, 
 		bufDirty    bool
 		err         error
 		count       int
-		deathSpiral int
 		elemsByPeer = make(map[*Peer]*QueueInboundElementsContainer, maxBatchSize)
 	)
 
@@ -120,17 +118,8 @@ func (device *Device) RoutineReceiveIncoming(recvName string, maxBatchSize int, 
 				device.scheduleBindUpdate()
 				return
 			}
-			if neterr, ok := err.(net.Error); ok && !neterr.Temporary() {
-				return
-			}
-			if deathSpiral < 10 {
-				deathSpiral++
-				time.Sleep(time.Second / 3)
-				continue
-			}
-			return
+			continue // Pacing is the Bind's responsibility; see [conn.ReceiveFunc].
 		}
-		deathSpiral = 0
 
 		// handle each packet in the batch
 		for _, meta := range packets[:count] {

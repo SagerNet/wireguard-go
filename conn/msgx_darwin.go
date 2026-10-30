@@ -10,10 +10,12 @@ package conn
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	M "github.com/sagernet/sing/common/metadata"
@@ -291,9 +293,13 @@ func (s *StdNetBind) makeReceiveMsgX(sock *stdNetSocket) ReceiveFunc {
 			if errno == unix.ECONNREFUSED {
 				return 0, nil
 			}
-			if connectedEndpoint != nil && rebindErrno(errno) {
+			if errno == unix.EBADF {
+				return 0, fmt.Errorf("%w: %w", net.ErrClosed, errno)
+			}
+			if errno == unix.ENOTCONN || connectedEndpoint != nil && rebindErrno(errno) {
 				return 0, fmt.Errorf("%w: %w", ErrRebindRequired, errno)
 			}
+			time.Sleep(time.Second / 3)
 			return 0, errno
 		}
 		if n == 0 {
