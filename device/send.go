@@ -83,6 +83,7 @@ func (elem *QueueOutboundElement) clearPointers() {
 // SendKeepalive queues a keepalive if no packets are queued for
 // peer.
 func (peer *Peer) SendKeepalive() {
+	var stagedDelta int
 	if len(peer.queue.staged) == 0 {
 		elem := peer.device.GetOutboundElement()
 		elem.buffer = peer.device.getSmallPacketBuf()
@@ -93,6 +94,7 @@ func (peer *Peer) SendKeepalive() {
 			select {
 			case peer.queue.staged <- elemsContainer:
 				peer.queuedOutboundPackets.Add(1)
+				stagedDelta++
 				peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
 			default:
 				peer.device.PutOutboundElement(elem)
@@ -103,7 +105,7 @@ func (peer *Peer) SendKeepalive() {
 			peer.device.PutOutboundElementsContainer(elemsContainer)
 		}
 	}
-	peer.SendStagedPackets()
+	peer.SendStagedPackets(stagedDelta)
 }
 
 // SendPriorityMessage invokes the [PeerPriorityMessageFunc] callback if one is
@@ -469,8 +471,8 @@ func (device *Device) RoutineReadFromTUN(id int, queue tun.Reader) {
 		}
 
 		for peer, elemsForPeer := range elemsByPeer {
-			peer.StagePackets(elemsForPeer)
-			peer.SendStagedPackets()
+			stagedDelta := peer.StagePackets(elemsForPeer)
+			peer.SendStagedPackets(stagedDelta)
 			delete(elemsByPeer, peer)
 		}
 
@@ -570,8 +572,7 @@ func (device *Device) InputPacket(destination []byte, packetSlices [][]byte) {
 	elem.packet = packet[:n]
 	elemsForPeer := device.GetOutboundElementsContainer()
 	elemsForPeer.elems = append(elemsForPeer.elems, elem)
-	peer.StagePackets(elemsForPeer)
-	peer.SendStagedPackets()
+	peer.SendStagedPackets(peer.StagePackets(elemsForPeer))
 }
 
 type InputPacketRef struct {
@@ -617,10 +618,11 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 		elemsForPeer.elems = append(elemsForPeer.elems, elem)
 	}
 	for peer, containers := range elemsByPeer {
+		var stagedDelta int
 		for _, elemsForPeer := range containers {
-			peer.StagePackets(elemsForPeer)
+			stagedDelta += peer.StagePackets(elemsForPeer)
 		}
-		peer.SendStagedPackets()
+		peer.SendStagedPackets(stagedDelta)
 	}
 	return unmatched
 }
@@ -629,19 +631,25 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 // If the queue is full, its oldest member is dropped to make room.
 // If the peer is not running, the data is quietly dropped.
 //
+// It returns a delta for len(peer.queue.staged) operations, which must be
+// passed in a subsequent call to [Peer.SendStagedPackets], where global stage
+// queue accounting changes are committed.
+//
 // [Peer.nonceMu] relies on this function being non-blocking.
-func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
+func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) (stagedDelta int) {
 	if running := peer.doIfRunning(func() {
 		peer.queuedOutboundPackets.Add(int32(len(elems.elems)))
 		for {
 			select {
 			case peer.queue.staged <- elems:
+				stagedDelta++
 				return
 			default:
 			}
 			select {
 			case tooOld := <-peer.queue.staged:
 				peer.queuedOutboundPackets.Add(-int32(len(tooOld.elems)))
+				stagedDelta--
 				for _, elem := range tooOld.elems {
 					peer.device.PutOutboundElement(elem)
 				}
@@ -655,10 +663,32 @@ func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
 		}
 		peer.device.PutOutboundElementsContainer(elems)
 	}
+	return stagedDelta
 }
 
-// SendStagedPackets sends any staged packets to Peer.
-func (peer *Peer) SendStagedPackets() {
+// SendStagedPackets sends any staged packets to Peer, if a valid keypair and
+// nonce are available.
+//
+// It accepts a delta for preceding len(peer.queue.staged) operations. Said
+// delta gets combined with what it performs, and committed to device-wide stage
+// queue accounting, if a global staged queue limit is configured.
+//
+// SendStagedPackets accepts stagedDelta in order to intentionally delay
+// device-wide stage queue accounting commit until the end of this func. This
+// strategy limits staged queue accounting to long-lived elements, i.e. those
+// awaiting a future handshake, and does not include elements that stage and are
+// immediately transmitted.
+func (peer *Peer) SendStagedPackets(stagedDelta int) {
+	defer func() {
+		if peer.device.config.queueStagedGlobalLimit > 0 {
+			stagedCount := peer.device.queue.stagedCount.Add(int64(stagedDelta))
+			if stagedCount > peer.device.config.queueStagedGlobalLimit {
+				// TODO(jwhited): count when this happens
+				peer.FlushStagedPackets(int(stagedCount - peer.device.config.queueStagedGlobalLimit))
+			}
+		}
+	}()
+
 	// SendStagedPackets may be called concurrently. Serialize nonce assignment
 	// with outbound enqueue so packets are transmitted in nonce order; excessive
 	// reordering can cause the receiver's replay filter to drop packets.
@@ -683,6 +713,7 @@ top:
 		var elemsContainerOOO *QueueOutboundElementsContainer
 		select {
 		case elemsContainer := <-peer.queue.staged:
+			stagedDelta--
 			i := 0
 			for _, elem := range elemsContainer.elems {
 				elem.peer = peer
@@ -706,7 +737,7 @@ top:
 			if elemsContainerOOO != nil {
 				// Already counted at their original staging; StagePackets will count them again.
 				peer.queuedOutboundPackets.Add(-int32(len(elemsContainerOOO.elems)))
-				peer.StagePackets(elemsContainerOOO) // XXX: Out of order, but we can't front-load go chans
+				stagedDelta += peer.StagePackets(elemsContainerOOO) // XXX: Out of order, but we can't front-load go chans
 			}
 
 			if len(elemsContainer.elems) == 0 {
@@ -726,11 +757,21 @@ top:
 	}
 }
 
-func (peer *Peer) FlushStagedPackets() {
+// FlushStagedPackets drains elements from [Peer.queue.staged] up to limit. If
+// limit is zero, FlushStagedPackets drains all elements.
+func (peer *Peer) FlushStagedPackets(limit int) {
+	var flushed int
+	defer func() {
+		peer.device.queue.stagedCount.Add(-(int64(flushed)))
+	}()
 	for {
+		if limit > 0 && flushed == limit {
+			return
+		}
 		select {
 		case elemsContainer := <-peer.queue.staged:
 			peer.queuedOutboundPackets.Add(-int32(len(elemsContainer.elems)))
+			flushed++
 			for _, elem := range elemsContainer.elems {
 				peer.device.PutOutboundElement(elem)
 			}

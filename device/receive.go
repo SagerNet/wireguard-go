@@ -486,7 +486,7 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
 			peer.SetEndpointFromPacket(elem.packetMeta.Endpoint)
 			peer.timersHandshakeComplete()
 			peer.SendPriorityMessage()
-			peer.SendStagedPackets()
+			peer.SendStagedPackets(0)
 		}
 		if ep, ok := elem.packetMeta.Endpoint.(conn.PeerAwareEndpoint); ok {
 			ep.FromPeer(peer.handshake.remoteStatic)
