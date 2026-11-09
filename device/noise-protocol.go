@@ -354,6 +354,10 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	handshake.mutex.Lock()
 	defer handshake.mutex.Unlock()
 
+	if !peer.runningState.isRunning.Load() {
+		return nil, errPeerStopped
+	}
+
 	// create ephemeral keys
 	var err error
 	if handshake.hybridHandshake {
@@ -428,7 +432,7 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 
 	// assign index
 	device.indexTable.Delete(handshake.localIndex)
-	msg.Sender, err = device.indexTable.NewIndexForHandshake(peer, handshake)
+	msg.Sender, err = device.indexTable.newIndexForHandshake(peer, handshake)
 	if err != nil {
 		return nil, err
 	}
@@ -594,6 +598,10 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	handshake.mutex.Lock()
 	defer handshake.mutex.Unlock()
 
+	if !peer.runningState.isRunning.Load() {
+		return nil, errPeerStopped
+	}
+
 	if handshake.state != handshakeInitiationConsumed {
 		return nil, errors.New("handshake initiation must be consumed first")
 	}
@@ -602,7 +610,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 
 	var err error
 	device.indexTable.Delete(handshake.localIndex)
-	handshake.localIndex, err = device.indexTable.NewIndexForHandshake(peer, handshake)
+	handshake.localIndex, err = device.indexTable.newIndexForHandshake(peer, handshake)
 	if err != nil {
 		return nil, err
 	}

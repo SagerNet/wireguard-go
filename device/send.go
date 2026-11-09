@@ -195,7 +195,9 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
-		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+		if err != errPeerStopped {
+			peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+		}
 		return err
 	}
 	if msg.HasKEM {
@@ -249,7 +251,9 @@ func (peer *Peer) SendHandshakeResponse(isRetry bool) error {
 
 	response, err := peer.device.CreateMessageResponse(peer)
 	if err != nil {
-		peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
+		if err != errPeerStopped {
+			peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
+		}
 		return err
 	}
 	if response.HasKEM {
