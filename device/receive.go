@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 
 	"github.com/sagernet/wireguard-go/conn"
@@ -102,6 +103,9 @@ func (device *Device) RoutineReceiveIncoming(recvName string, maxBatchSize int, 
 		buf.decRef()
 	}()
 
+	copyHandshake := device.hasDistinctSmallPacketBufPool()
+	copyTransport := copyHandshake && (runtime.GOOS == "darwin" || runtime.GOOS == "ios")
+
 	for {
 		if bufDirty {
 			buf.decRef()
@@ -164,11 +168,17 @@ func (device *Device) RoutineReceiveIncoming(recvName string, maxBatchSize int, 
 				// create work element
 				peer := value.peer
 				elem := device.GetInboundElement()
-				bufDirty = true
-				buf.incRef()
-				elem.buffer = buf
-				elem.packet = packet
-				elem.packetMeta = meta
+				if copyTransport && len(packet) <= smallPacketBufSize {
+					elem.buffer = device.getSmallPacketBuf()
+					elem.packet = elem.buffer.slab[:copy(elem.buffer.slab, packet)]
+					elem.packetMeta = conn.ReceivedPacket{Size: len(packet), Endpoint: meta.Endpoint}
+				} else {
+					bufDirty = true
+					buf.incRef()
+					elem.buffer = buf
+					elem.packet = packet
+					elem.packetMeta = meta
+				}
 				elem.keypair = keypair
 				elem.counter = 0
 
@@ -202,17 +212,26 @@ func (device *Device) RoutineReceiveIncoming(recvName string, maxBatchSize int, 
 				continue
 			}
 
-			buf.incRef()
-			select {
-			case device.queue.handshake.c <- QueueHandshakeElement{
+			handshakeElem := QueueHandshakeElement{
 				msgType:    msgType,
 				buffer:     buf,
 				packet:     packet,
 				packetMeta: meta,
-			}:
-				bufDirty = true
+			}
+			if copyHandshake {
+				handshakeElem.buffer = device.getSmallPacketBuf()
+				handshakeElem.packet = handshakeElem.buffer.slab[:copy(handshakeElem.buffer.slab, packet)]
+				handshakeElem.packetMeta = conn.ReceivedPacket{Size: len(packet), Endpoint: meta.Endpoint}
+			} else {
+				buf.incRef()
+			}
+			select {
+			case device.queue.handshake.c <- handshakeElem:
+				if !copyHandshake {
+					bufDirty = true
+				}
 			default:
-				buf.decRef()
+				handshakeElem.buffer.decRef()
 			}
 		}
 		for peer, elemsContainer := range elemsByPeer {

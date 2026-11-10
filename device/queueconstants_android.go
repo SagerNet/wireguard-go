@@ -10,10 +10,10 @@ import "github.com/sagernet/wireguard-go/conn"
 /* Reduce memory consumption for Android */
 
 const (
-	DefaultQueueStagedSize            = conn.IdealBatchSize
-	DefaultQueueOutboundSize          = 1024
-	DefaultQueueInboundSize           = 1024
-	DefaultQueueHandshakeSize         = 1024
-	MaxSegmentSize                    = (1 << 16) - 1 // largest possible UDP datagram
-	DefaultPreallocatedBuffersPerPool = 4096
+	DefaultQueueStagedSize        = conn.IdealBatchSize
+	DefaultQueueOutboundSize      = 1024
+	DefaultQueueInboundSize       = 1024
+	DefaultQueueHandshakeSize     = 1024
+	MaxSegmentSize                = (1 << 16) - 1 // largest possible UDP datagram
+	DefaultQueueStagedGlobalLimit = 4096
 )
