@@ -580,7 +580,7 @@ func NewDevice(ctx context.Context, tunDevice tun.Device, bind conn.Bind, logger
 	// start workers
 
 	if workers == 0 {
-		workers = runtime.NumCPU()
+		workers = runtime.GOMAXPROCS(0)
 	}
 	device.state.stopping.Wait()
 	device.queue.encryption.wg.Add(workers) // One for each RoutineHandshake
