@@ -195,23 +195,26 @@ func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	// If uport is 0, we can retry on failure.
 again:
 	port := int(uport)
-	var v4conn, v6conn *net.UDPConn
 	var v4pc *ipv4.PacketConn
 	var v6pc *ipv6.PacketConn
 
-	v4conn, port, err = listenNet(s.externalControl, "udp4", port)
-	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
+	v4conn, v4port, err := listenNet(s.externalControl, "udp4", port)
+	if err == nil {
+		port = v4port
+	} else if !errors.Is(err, syscall.EAFNOSUPPORT) {
 		return nil, 0, err
 	}
 
 	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet(s.externalControl, "udp6", port)
+	v6conn, v6port, err := listenNet(s.externalControl, "udp6", port)
 	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
 		v4conn.Close()
 		tries++
 		goto again
 	}
-	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
+	if err == nil {
+		port = v6port
+	} else if !errors.Is(err, syscall.EAFNOSUPPORT) {
 		v4conn.Close()
 		return nil, 0, err
 	}
