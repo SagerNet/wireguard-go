@@ -191,8 +191,6 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
-	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
-
 	candidates := peer.resolveEndpoints()
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
@@ -202,9 +200,16 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		}
 		return err
 	}
+	handshakeType := ""
 	if msg.HasKEM {
+		if isRetry {
+			handshakeType = " (hybrid, retry)"
+		} else {
+			handshakeType = " (hybrid)"
+		}
 		msg.IsRetry = isRetry
 	}
+	peer.device.log.Verbosef("%v - Sending handshake initiation%s", peer, handshakeType)
 
 	sz := MessageInitiationSize
 	if msg.HasKEM {
@@ -249,8 +254,6 @@ func (peer *Peer) SendHandshakeResponse(isRetry bool) error {
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
-	peer.device.log.Verbosef("%v - Sending handshake response", peer)
-
 	response, err := peer.device.CreateMessageResponse(peer)
 	if err != nil {
 		if err != errPeerStopped {
@@ -258,9 +261,16 @@ func (peer *Peer) SendHandshakeResponse(isRetry bool) error {
 		}
 		return err
 	}
+	handshakeType := ""
 	if response.HasKEM {
+		if isRetry {
+			handshakeType = " (hybrid, retry)"
+		} else {
+			handshakeType = " (hybrid)"
+		}
 		response.IsRetry = isRetry
 	}
+	peer.device.log.Verbosef("%v - Sending handshake response%s", peer, handshakeType)
 
 	sz := MessageResponseSize
 	if response.HasKEM {

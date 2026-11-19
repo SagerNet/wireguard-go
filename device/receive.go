@@ -379,7 +379,16 @@ func (device *Device) RoutineHandshake(id int) {
 			// update endpoint
 			peer.SetEndpointFromPacket(elem.packetMeta.Endpoint)
 
-			device.log.Verbosef("%v - Received handshake initiation", peer)
+			handshakeType := ""
+			if msg.HasKEM {
+				if msg.IsRetry {
+					handshakeType = " (hybrid, retry)"
+				} else {
+					handshakeType = " (hybrid)"
+				}
+			}
+			device.log.Verbosef("%v - Received handshake initiation%s", peer, handshakeType)
+
 			peer.rxBytes.Add(uint64(len(elem.packet)))
 
 			peer.SendHandshakeResponse(msg.IsRetry)
@@ -409,7 +418,16 @@ func (device *Device) RoutineHandshake(id int) {
 			// update endpoint
 			peer.SetEndpointFromPacket(elem.packetMeta.Endpoint)
 
-			device.log.Verbosef("%v - Received handshake response", peer)
+			handshakeType := ""
+			if msg.HasKEM {
+				if msg.IsRetry {
+					handshakeType = " (hybrid, retry)"
+				} else {
+					handshakeType = " (hybrid)"
+				}
+			}
+			device.log.Verbosef("%v - Received handshake response%s", peer, handshakeType)
+
 			peer.rxBytes.Add(uint64(len(elem.packet)))
 
 			// update timers
