@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/tun"
 )
 
@@ -51,7 +52,7 @@ func (device *Device) PopulatePools() {
 	}
 	device.pool.outboundElementsContainer = &sync.Pool{
 		New: func() any {
-			s := make([]*QueueOutboundElement, 0, device.BatchSize())
+			s := make([]*QueueOutboundElement, 0, max(device.BatchSize(), conn.IdealBatchSize))
 			return &QueueOutboundElementsContainer{elems: s}
 		},
 	}

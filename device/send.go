@@ -93,7 +93,7 @@ func (peer *Peer) SendKeepalive() {
 		if queued := peer.doIfRunning(func() {
 			select {
 			case peer.queue.staged <- elemsContainer:
-				peer.queuedOutboundPackets.Add(1)
+				peer.stagedPackets.Add(1)
 				stagedDelta++
 				peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
 			default:
@@ -505,12 +505,15 @@ func (device *Device) RoutineReadFromTUN(id int, queue tun.Reader) {
 	}
 }
 
-// maxQueuedInputPackets bounds the staged+outbound backlog of a peer fed via
-// InputPacket/InputPackets. Injected packets beyond it are dropped before they
-// are copied into pooled message buffers, like a full qdisc: injection has no
-// flow control, and the queues are bounded in containers (up to a full batch
-// each), so without this cap a flood is buffered instead of dropped.
-const maxQueuedInputPackets = 2048
+const (
+	maxStagedPackets         = 128
+	maxQueuedOutboundPackets = 1024
+)
+
+type InputPacketRef struct {
+	Destination  []byte
+	PacketSlices [][]byte
+}
 
 func (device *Device) inputPacketPeer(destination []byte, packetSlices [][]byte) *Peer {
 	var src, dst netip.Addr
@@ -555,21 +558,14 @@ func gatherPacketBytes(packetSlices [][]byte, offset int, destination []byte) bo
 	return false
 }
 
-func (device *Device) InputPacket(destination []byte, packetSlices [][]byte) {
-	peer := device.inputPacketPeer(destination, packetSlices)
-	if peer == nil {
-		return
-	}
-	if peer.queuedOutboundPackets.Load() >= maxQueuedInputPackets {
-		return
-	}
+func (device *Device) newInputElement(packetSlices ...[]byte) *QueueOutboundElement {
 	var totalLength int
 	for _, packetSlice := range packetSlices {
 		totalLength += len(packetSlice)
 	}
 	allocLength := MessageEncapsulatingTransportSize + MessageTransportHeaderSize + totalLength + PaddingMultiple + chacha20poly1305.Overhead
 	if allocLength > MaxMessageSize {
-		return
+		return nil
 	}
 	elem := device.GetOutboundElement()
 	elem.buffer = device.getInputPacketBuf(allocLength)
@@ -580,46 +576,32 @@ func (device *Device) InputPacket(destination []byte, packetSlices [][]byte) {
 		n += copy(packet[n:], packetSlice)
 	}
 	elem.packet = packet[:n]
-	elemsForPeer := device.GetOutboundElementsContainer()
-	elemsForPeer.elems = append(elemsForPeer.elems, elem)
-	peer.SendStagedPackets(peer.StagePackets(elemsForPeer))
+	return elem
 }
 
-type InputPacketRef struct {
-	Destination  []byte
-	PacketSlices [][]byte
-}
-
+// InputPackets injects whole IP packets without waiting: packets for a peer
+// whose pipeline is full are dropped. Packets matching no peer are returned.
 func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef {
 	var unmatched []*InputPacketRef
-	elemsByPeer := make(map[*Peer][]*QueueOutboundElementsContainer, len(packets))
+	elemsByPeer := make(map[*Peer][]*QueueOutboundElementsContainer)
 	for _, packetRef := range packets {
 		peer := device.inputPacketPeer(packetRef.Destination, packetRef.PacketSlices)
 		if peer == nil {
 			unmatched = append(unmatched, packetRef)
 			continue
 		}
-		if peer.queuedOutboundPackets.Load() >= maxQueuedInputPackets {
-			continue
-		}
-		var totalLength int
-		for _, packetSlice := range packetRef.PacketSlices {
-			totalLength += len(packetSlice)
-		}
-		allocLength := MessageEncapsulatingTransportSize + MessageTransportHeaderSize + totalLength + PaddingMultiple + chacha20poly1305.Overhead
-		if allocLength > MaxMessageSize {
-			continue
-		}
-		elem := device.GetOutboundElement()
-		elem.buffer = device.getInputPacketBuf(allocLength)
-		elem.plaintextOffset = MessageEncapsulatingTransportSize + MessageTransportHeaderSize
-		packet := elem.buffer.slab[elem.plaintextOffset:]
-		var n int
-		for _, packetSlice := range packetRef.PacketSlices {
-			n += copy(packet[n:], packetSlice)
-		}
-		elem.packet = packet[:n]
 		containers := elemsByPeer[peer]
+		var collected int
+		if len(containers) > 0 {
+			collected = (len(containers)-1)*conn.IdealBatchSize + len(containers[len(containers)-1].elems)
+		}
+		if peer.stagedFull(collected) || peer.queuedOutboundPackets.Load()+int32(collected) >= maxQueuedOutboundPackets {
+			continue
+		}
+		elem := device.newInputElement(packetRef.PacketSlices...)
+		if elem == nil {
+			continue
+		}
 		if len(containers) == 0 || len(containers[len(containers)-1].elems) >= conn.IdealBatchSize {
 			containers = append(containers, device.GetOutboundElementsContainer())
 			elemsByPeer[peer] = containers
@@ -637,6 +619,83 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 	return unmatched
 }
 
+// WritePackets injects whole IP packets routed to this peer, waiting while the
+// peer's encryption and transmission pipeline is full. Packets are dropped if
+// the peer stops or is still waiting for a handshake with a full staged queue.
+func (peer *Peer) WritePackets(packets [][]byte) {
+	device := peer.device
+	for len(packets) > 0 {
+		if !peer.waitOutboundSpace() {
+			return
+		}
+		batch := packets[:min(len(packets), conn.IdealBatchSize)]
+		packets = packets[len(batch):]
+		if peer.stagedFull(0) {
+			continue
+		}
+		elemsForPeer := device.GetOutboundElementsContainer()
+		for _, packet := range batch {
+			elem := device.newInputElement(packet)
+			if elem != nil {
+				elemsForPeer.elems = append(elemsForPeer.elems, elem)
+			}
+		}
+		if len(elemsForPeer.elems) == 0 {
+			device.PutOutboundElementsContainer(elemsForPeer)
+			continue
+		}
+		peer.SendStagedPackets(peer.StagePackets(elemsForPeer))
+	}
+}
+
+func (peer *Peer) stagedFull(pending int) bool {
+	if peer.stagedPackets.Load()+int32(pending) < maxStagedPackets {
+		return false
+	}
+	keypair := peer.keypairs.Current()
+	return keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || sinceIncludingSleep(keypair.created) >= RejectAfterTime
+}
+
+func (peer *Peer) waitOutboundSpace() bool {
+	for {
+		if !peer.runningState.isRunning.Load() {
+			return false
+		}
+		if peer.queuedOutboundPackets.Load() < maxQueuedOutboundPackets {
+			return true
+		}
+		peer.outboundSpace.Lock()
+		if peer.outboundSpace.ready == nil {
+			peer.outboundSpace.ready = make(chan struct{})
+		}
+		ready := peer.outboundSpace.ready
+		peer.outboundSpace.Unlock()
+		if !peer.runningState.isRunning.Load() {
+			return false
+		}
+		if peer.queuedOutboundPackets.Load() < maxQueuedOutboundPackets {
+			return true
+		}
+		<-ready
+	}
+}
+
+func (peer *Peer) releaseOutboundPackets(count int) {
+	remaining := peer.queuedOutboundPackets.Add(-int32(count))
+	if remaining < maxQueuedOutboundPackets && remaining+int32(count) >= maxQueuedOutboundPackets {
+		peer.wakeOutboundWaiters()
+	}
+}
+
+func (peer *Peer) wakeOutboundWaiters() {
+	peer.outboundSpace.Lock()
+	if peer.outboundSpace.ready != nil {
+		close(peer.outboundSpace.ready)
+		peer.outboundSpace.ready = nil
+	}
+	peer.outboundSpace.Unlock()
+}
+
 // StagePackets attempts to enqueue elements into the peer's staging queue.
 // If the queue is full, its oldest member is dropped to make room.
 // If the peer is not running, the data is quietly dropped.
@@ -648,7 +707,7 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 // [Peer.nonceMu] relies on this function being non-blocking.
 func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) (stagedDelta int) {
 	if running := peer.doIfRunning(func() {
-		peer.queuedOutboundPackets.Add(int32(len(elems.elems)))
+		peer.stagedPackets.Add(int32(len(elems.elems)))
 		for {
 			select {
 			case peer.queue.staged <- elems:
@@ -658,7 +717,7 @@ func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) (stagedDel
 			}
 			select {
 			case tooOld := <-peer.queue.staged:
-				peer.queuedOutboundPackets.Add(-int32(len(tooOld.elems)))
+				peer.stagedPackets.Add(-int32(len(tooOld.elems)))
 				stagedDelta--
 				for _, elem := range tooOld.elems {
 					peer.device.PutOutboundElement(elem)
@@ -724,6 +783,7 @@ top:
 		select {
 		case elemsContainer := <-peer.queue.staged:
 			stagedDelta--
+			peer.stagedPackets.Add(-int32(len(elemsContainer.elems)))
 			i := 0
 			for _, elem := range elemsContainer.elems {
 				elem.peer = peer
@@ -745,8 +805,6 @@ top:
 			elemsContainer.elems = elemsContainer.elems[:i]
 
 			if elemsContainerOOO != nil {
-				// Already counted at their original staging; StagePackets will count them again.
-				peer.queuedOutboundPackets.Add(-int32(len(elemsContainerOOO.elems)))
 				stagedDelta += peer.StagePackets(elemsContainerOOO) // XXX: Out of order, but we can't front-load go chans
 			}
 
@@ -755,6 +813,7 @@ top:
 				goto top
 			}
 
+			peer.queuedOutboundPackets.Add(int32(len(elemsContainer.elems)))
 			peer.queueOutboundIfRunning(elemsContainer)
 
 			if elemsContainerOOO != nil {
@@ -780,7 +839,7 @@ func (peer *Peer) FlushStagedPackets(limit int) {
 		}
 		select {
 		case elemsContainer := <-peer.queue.staged:
-			peer.queuedOutboundPackets.Add(-int32(len(elemsContainer.elems)))
+			peer.stagedPackets.Add(-int32(len(elemsContainer.elems)))
 			flushed++
 			for _, elem := range elemsContainer.elems {
 				peer.device.PutOutboundElement(elem)
@@ -903,7 +962,7 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 		// The timers and SendBuffers code are resilient to a few stragglers.
 		// TODO: rework peer shutdown order to ensure
 		// that we never accidentally keep timers alive longer than necessary.
-		peer.queuedOutboundPackets.Add(-int32(len(elemsContainer.elems)))
+		peer.releaseOutboundPackets(len(elemsContainer.elems))
 		for _, elem := range elemsContainer.elems {
 			device.PutOutboundElement(elem)
 		}
@@ -925,7 +984,7 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 	if dataSent {
 		peer.timersDataSent()
 	}
-	peer.queuedOutboundPackets.Add(-int32(len(elemsContainer.elems)))
+	peer.releaseOutboundPackets(len(elemsContainer.elems))
 	for _, elem := range elemsContainer.elems {
 		device.PutOutboundElement(elem)
 	}
