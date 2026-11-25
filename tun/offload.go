@@ -55,25 +55,32 @@ type GSOOptions struct {
 }
 
 const (
-	gsoIPv4SrcAddrOffset = 12
-	gsoIPv6SrcAddrOffset = 8
-	gsoTCPFlagsOffset    = 13
-	gsoIPProtoTCP        = 6
-	gsoIPProtoUDP        = 17
+	ipv4SrcAddrOffset = 12
+	ipv6SrcAddrOffset = 8
+)
+
+const tcpFlagsOffset = 13
+
+const (
+	tcpFlagFIN uint8 = 0x01
+	tcpFlagPSH uint8 = 0x08
+	tcpFlagACK uint8 = 0x10
 )
 
 const (
-	gsoTCPFlagFIN uint8 = 0x01
-	gsoTCPFlagPSH uint8 = 0x08
+	// defined here in order to avoid importation of any platform-specific pkgs
+	ipProtoTCP = 6
+	ipProtoUDP = 17
 )
 
-// GSOSplit splits packets from in into outBufs[<index>][outOffset:], writing
+// GSOSplit splits packets from 'in' into outBufs[<index>][outOffset:], writing
 // the size of each element into sizes. It returns the number of buffers
-// populated, and/or an error. Callers may pass an in slice that overlaps with
-// the first element of outBufs, i.e. &in[0] may be equal to
+// populated, and/or an error. Callers may pass an 'in' slice that overlaps with
+// the first element of outBuffers, i.e. &in[0] may be equal to
 // &outBufs[0][outOffset]. GSONone is a valid options.GSOType regardless of the
 // value of options.NeedsCsum. Length of each outBufs element must be greater
-// than or equal to the length of in, otherwise output may be silently truncated.
+// than or equal to the length of 'in', otherwise output may be silently
+// truncated.
 func GSOSplit(in []byte, options GSOOptions, outBufs [][]byte, sizes []int, outOffset int) (int, error) {
 	cSumAt := int(options.CsumStart) + int(options.CsumOffset)
 	if cSumAt+1 >= len(in) {
@@ -84,12 +91,15 @@ func GSOSplit(in []byte, options GSOOptions, outBufs [][]byte, sizes []int, outO
 		return 0, fmt.Errorf("length of packet (%d) < GSO HdrLen (%d)", len(in), options.HdrLen)
 	}
 
+	// Handle the conditions where we are copying a single element to outBuffs.
 	payloadLen := len(in) - int(options.HdrLen)
 	if options.GSOType == GSONone || payloadLen < int(options.GSOSize) {
 		if len(in) > len(outBufs[0][outOffset:]) {
 			return 0, fmt.Errorf("length of packet (%d) exceeds output element length (%d)", len(in), len(outBufs[0][outOffset:]))
 		}
 		if options.NeedsCsum {
+			// The initial value at the checksum offset should be summed with
+			// the checksum we compute. This is typically the pseudo-header sum.
 			initial := binary.BigEndian.Uint16(in[cSumAt:])
 			in[cSumAt], in[cSumAt+1] = 0, 0
 			binary.BigEndian.PutUint16(in[cSumAt:], ^Checksum(in[options.CsumStart:], initial))
@@ -123,24 +133,24 @@ func GSOSplit(in []byte, options GSOOptions, outBufs [][]byte, sizes []int, outO
 	}
 
 	iphLen := int(options.CsumStart)
-	srcAddrOffset := gsoIPv6SrcAddrOffset
+	srcAddrOffset := ipv6SrcAddrOffset
 	addrLen := 16
 	if ipVersion == 4 {
-		srcAddrOffset = gsoIPv4SrcAddrOffset
+		srcAddrOffset = ipv4SrcAddrOffset
 		addrLen = 4
 	}
 	transportCsumAt := int(options.CsumStart + options.CsumOffset)
 	var firstTCPSeqNum uint32
 	var protocol uint8
 	if options.GSOType == GSOTCPv4 || options.GSOType == GSOTCPv6 {
-		protocol = gsoIPProtoTCP
+		protocol = ipProtoTCP
 		if len(in) < int(options.CsumStart)+20 {
 			return 0, fmt.Errorf("length of packet (%d) < GSO CsumStart (%d) + minimum TCP header size (%d)",
 				len(in), options.CsumStart, 20)
 		}
 		firstTCPSeqNum = binary.BigEndian.Uint32(in[options.CsumStart+4:])
 	} else {
-		protocol = gsoIPProtoUDP
+		protocol = ipProtoUDP
 	}
 	nextSegmentDataAt := int(options.HdrLen)
 	i := 0
@@ -159,35 +169,45 @@ func GSOSplit(in []byte, options GSOOptions, outBufs [][]byte, sizes []int, outO
 
 		copy(out, in[:iphLen])
 		if ipVersion == 4 {
+			// For IPv4 we are responsible for incrementing the ID field,
+			// updating the total len field, and recalculating the header
+			// checksum.
 			if i > 0 {
 				id := binary.BigEndian.Uint16(out[4:])
 				id += uint16(i)
 				binary.BigEndian.PutUint16(out[4:], id)
 			}
-			out[10], out[11] = 0, 0
+			out[10], out[11] = 0, 0 // clear ipv4 header checksum
 			binary.BigEndian.PutUint16(out[2:], uint16(totalLen))
 			ipv4CSum := ^Checksum(out[:iphLen], 0)
 			binary.BigEndian.PutUint16(out[10:], ipv4CSum)
 		} else {
+			// For IPv6 we are responsible for updating the payload length field.
 			binary.BigEndian.PutUint16(out[4:], uint16(totalLen-iphLen))
 		}
 
+		// copy transport header
 		copy(out[options.CsumStart:options.HdrLen], in[options.CsumStart:options.HdrLen])
 
-		if protocol == gsoIPProtoTCP {
+		if protocol == ipProtoTCP {
+			// set TCP seq and adjust TCP flags
 			tcpSeq := firstTCPSeqNum + uint32(options.GSOSize*uint16(i))
 			binary.BigEndian.PutUint32(out[options.CsumStart+4:], tcpSeq)
 			if nextSegmentEnd != len(in) {
-				clearFlags := gsoTCPFlagFIN | gsoTCPFlagPSH
-				out[options.CsumStart+gsoTCPFlagsOffset] &^= clearFlags
+				// FIN and PSH should only be set on last segment
+				clearFlags := tcpFlagFIN | tcpFlagPSH
+				out[options.CsumStart+tcpFlagsOffset] &^= clearFlags
 			}
 		} else {
+			// set UDP header len
 			binary.BigEndian.PutUint16(out[options.CsumStart+4:], uint16(segmentDataLen)+(options.HdrLen-options.CsumStart))
 		}
 
+		// payload
 		copy(out[options.HdrLen:], in[nextSegmentDataAt:nextSegmentEnd])
 
-		out[transportCsumAt], out[transportCsumAt+1] = 0, 0
+		// transport checksum
+		out[transportCsumAt], out[transportCsumAt+1] = 0, 0 // clear tcp/udp checksum
 		transportHeaderLen := int(options.HdrLen - options.CsumStart)
 		lenForPseudo := uint16(transportHeaderLen + segmentDataLen)
 		transportCSum := PseudoHeaderChecksum(protocol, in[srcAddrOffset:srcAddrOffset+addrLen], in[srcAddrOffset+addrLen:srcAddrOffset+addrLen*2], lenForPseudo)

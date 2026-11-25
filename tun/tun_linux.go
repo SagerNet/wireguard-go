@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
  */
 
 package tun
@@ -29,6 +29,7 @@ const (
 
 type NativeTun struct {
 	tunFile                 *os.File
+	tunRawConn              syscall.RawConn
 	index                   int32      // if index
 	errors                  chan error // async error handling
 	events                  chan Event // device related events
@@ -48,8 +49,8 @@ type NativeTun struct {
 	readOpMu sync.Mutex                    // readOpMu guards readBuff
 	readBuff [virtioNetHdrLen + 65535]byte // if vnetHdr every read() is prefixed by virtioNetHdr
 
-	writeOpMu   sync.Mutex // writeOpMu guards toWrite, tcpGROTable, udpGROTable, gro
-	toWrite     []int
+	writeOpMu   sync.Mutex // writeOpMu guards the following fields
+	toWrite     groToWrite
 	tcpGROTable *tcpGROTable
 	udpGROTable *udpGROTable
 	gro         groDisablementFlags
@@ -269,21 +270,15 @@ func (tun *NativeTun) setMTU(n int) error {
 
 	defer unix.Close(fd)
 
-	// do ioctl call
-	var ifr [ifReqSize]byte
-	copy(ifr[:], name)
-	*(*uint32)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])) = uint32(n)
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(fd),
-		uintptr(unix.SIOCSIFMTU),
-		uintptr(unsafe.Pointer(&ifr[0])),
-	)
-
-	if errno != 0 {
-		return fmt.Errorf("failed to set MTU of TUN device: %w", errno)
+	req, err := unix.NewIfreq(name)
+	if err != nil {
+		return fmt.Errorf("unix.NewIfreq(%q): %w", name, err)
 	}
-
+	req.SetUint32(uint32(n))
+	err = unix.IoctlIfreq(fd, unix.SIOCSIFMTU, req)
+	if err != nil {
+		return fmt.Errorf("failed to set MTU of TUN device %q: %w", name, err)
+	}
 	return nil
 }
 
@@ -360,31 +355,53 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	defer func() {
 		tun.tcpGROTable.reset()
 		tun.udpGROTable.reset()
+		tun.toWrite.reset()
 		tun.writeOpMu.Unlock()
 	}()
 	var (
 		errs  error
 		total int
 	)
-	tun.toWrite = tun.toWrite[:0]
-	if tun.vnetHdr {
-		err := handleGRO(bufs, offset, tun.tcpGROTable, tun.udpGROTable, tun.gro, &tun.toWrite)
-		if err != nil {
-			return 0, err
-		}
-		offset -= virtioNetHdrLen
-	} else {
+	if !tun.vnetHdr {
 		for i := range bufs {
-			tun.toWrite = append(tun.toWrite, i)
+			n, err := tun.tunFile.Write(bufs[i][offset:])
+			if errors.Is(err, syscall.EBADFD) {
+				return total, os.ErrClosed
+			}
+			if err != nil {
+				errs = errors.Join(errs, err)
+			} else {
+				total += n
+			}
 		}
+		return total, errs
 	}
-	for _, bufsI := range tun.toWrite {
-		n, err := tun.tunFile.Write(bufs[bufsI][offset:])
-		if errors.Is(err, syscall.EBADFD) {
+	err := handleGRO(bufs, offset, tun.tcpGROTable, tun.udpGROTable, tun.gro, &tun.toWrite)
+	if err != nil {
+		return 0, err
+	}
+	for _, nb := range tun.toWrite.iovs {
+		var werr error
+		var n int
+		err := tun.tunRawConn.Write(func(fd uintptr) bool {
+			for {
+				n, werr = unix.Writev(int(fd), nb)
+				if errors.Is(werr, syscall.EINTR) {
+					continue // quick retry on interrupt, EINTR is never returned with partial writes
+				}
+				return !errors.Is(werr, syscall.EAGAIN) // poller retry on "would block"
+			}
+		})
+		// err is a poller error (e.g. fd closed before the syscall)
+		// werr is the Writev syscall error itself.
+		if err != nil {
+			return total, err
+		}
+		if errors.Is(werr, syscall.EBADFD) {
 			return total, os.ErrClosed
 		}
-		if err != nil {
-			errs = errors.Join(errs, err)
+		if werr != nil {
+			errs = errors.Join(errs, werr)
 		} else {
 			total += n
 		}
@@ -402,73 +419,32 @@ func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, e
 		return 0, err
 	}
 	in = in[virtioNetHdrLen:]
-	if hdr.gsoType == unix.VIRTIO_NET_HDR_GSO_NONE {
-		if hdr.flags&unix.VIRTIO_NET_HDR_F_NEEDS_CSUM != 0 {
-			// This means CHECKSUM_PARTIAL in skb context. We are responsible
-			// for computing the checksum starting at hdr.csumStart and placing
-			// at hdr.csumOffset.
-			err = gsoNoneChecksum(in, hdr.csumStart, hdr.csumOffset)
-			if err != nil {
-				return 0, err
-			}
-		}
-		if len(in) > len(bufs[0][offset:]) {
-			return 0, fmt.Errorf("read len %d overflows bufs element len %d", len(in), len(bufs[0][offset:]))
-		}
-		n := copy(bufs[0][offset:], in)
-		sizes[0] = n
-		return 1, nil
-	}
-	if hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_TCPV4 && hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_TCPV6 && hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_UDP_L4 {
-		return 0, fmt.Errorf("unsupported virtio GSO type: %d", hdr.gsoType)
+
+	options, err := hdr.toGSOOptions()
+	if err != nil {
+		return 0, err
 	}
 
-	ipVersion := in[0] >> 4
-	switch ipVersion {
-	case 4:
-		if hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_TCPV4 && hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_UDP_L4 {
-			return 0, fmt.Errorf("ip header version: %d, GSO type: %d", ipVersion, hdr.gsoType)
-		}
-	case 6:
-		if hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_TCPV6 && hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_UDP_L4 {
-			return 0, fmt.Errorf("ip header version: %d, GSO type: %d", ipVersion, hdr.gsoType)
-		}
-	default:
-		return 0, fmt.Errorf("invalid ip header version: %d", ipVersion)
-	}
-
-	// Don't trust hdr.hdrLen from the kernel as it can be equal to the length
+	// Don't trust HdrLen from the kernel as it can be equal to the length
 	// of the entire first packet when the kernel is handling it as part of a
 	// FORWARD path. Instead, parse the transport header length and add it onto
-	// csumStart, which is synonymous for IP header length.
-	if hdr.gsoType == unix.VIRTIO_NET_HDR_GSO_UDP_L4 {
-		hdr.hdrLen = hdr.csumStart + 8
-	} else {
-		if len(in) <= int(hdr.csumStart+12) {
+	// CsumStart, which is synonymous for IP header length.
+	if options.GSOType == GSOUDPL4 {
+		options.HdrLen = options.CsumStart + 8
+	} else if options.GSOType != GSONone {
+		if len(in) <= int(options.CsumStart+12) {
 			return 0, errors.New("packet is too short")
 		}
 
-		tcpHLen := uint16(in[hdr.csumStart+12] >> 4 * 4)
+		tcpHLen := uint16(in[options.CsumStart+12] >> 4 * 4)
 		if tcpHLen < 20 || tcpHLen > 60 {
 			// A TCP header must be between 20 and 60 bytes in length.
 			return 0, fmt.Errorf("tcp header len is invalid: %d", tcpHLen)
 		}
-		hdr.hdrLen = hdr.csumStart + tcpHLen
+		options.HdrLen = options.CsumStart + tcpHLen
 	}
 
-	if len(in) < int(hdr.hdrLen) {
-		return 0, fmt.Errorf("length of packet (%d) < virtioNetHdr.hdrLen (%d)", len(in), hdr.hdrLen)
-	}
-
-	if hdr.hdrLen < hdr.csumStart {
-		return 0, fmt.Errorf("virtioNetHdr.hdrLen (%d) < virtioNetHdr.csumStart (%d)", hdr.hdrLen, hdr.csumStart)
-	}
-	cSumAt := int(hdr.csumStart + hdr.csumOffset)
-	if cSumAt+1 >= len(in) {
-		return 0, fmt.Errorf("end of checksum offset (%d) exceeds packet length (%d)", cSumAt+1, len(in))
-	}
-
-	return gsoSplit(in, hdr, bufs, sizes, offset, ipVersion == 6)
+	return GSOSplit(in, options, bufs, sizes, offset)
 }
 
 func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
@@ -525,14 +501,16 @@ func (tun *NativeTun) BatchSize() int {
 	return tun.batchSize
 }
 
-// DisableUDPGRO disables UDP GRO if it is enabled.
+// DisableUDPGRO disables UDP GRO if it is enabled. See the GRODevice interface
+// for cases where it should be called.
 func (tun *NativeTun) DisableUDPGRO() {
 	tun.writeOpMu.Lock()
 	tun.gro.disableUDPGRO()
 	tun.writeOpMu.Unlock()
 }
 
-// DisableTCPGRO disables TCP GRO if it is enabled.
+// DisableTCPGRO disables TCP GRO if it is enabled. See the GRODevice interface
+// for cases where it should be called.
 func (tun *NativeTun) DisableTCPGRO() {
 	tun.writeOpMu.Lock()
 	tun.gro.disableTCPGRO()
@@ -551,7 +529,9 @@ func (tun *NativeTun) initFromFlags(name string) error {
 		return err
 	}
 	if e := sc.Control(func(fd uintptr) {
-		var ifr *unix.Ifreq
+		var (
+			ifr *unix.Ifreq
+		)
 		ifr, err = unix.NewIfreq(name)
 		if err != nil {
 			return
@@ -620,6 +600,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 
 // CreateTUNFromFile creates a Device from an os.File with the provided MTU.
 func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
+	var err error
 	tun := &NativeTun{
 		tunFile:                 file,
 		events:                  make(chan Event, 5),
@@ -627,7 +608,12 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 		statusListenersShutdown: make(chan struct{}),
 		tcpGROTable:             newTCPGROTable(),
 		udpGROTable:             newUDPGROTable(),
-		toWrite:                 make([]int, 0, conn.IdealBatchSize),
+		toWrite:                 newGROToWrite(),
+	}
+
+	tun.tunRawConn, err = tun.tunFile.SyscallConn()
+	if err != nil {
+		return nil, err
 	}
 
 	name, err := tun.Name()
@@ -683,7 +669,11 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
 		errors:      make(chan error, 5),
 		tcpGROTable: newTCPGROTable(),
 		udpGROTable: newUDPGROTable(),
-		toWrite:     make([]int, 0, conn.IdealBatchSize),
+		toWrite:     newGROToWrite(),
+	}
+	tun.tunRawConn, err = tun.tunFile.SyscallConn()
+	if err != nil {
+		return nil, "", err
 	}
 	name, err := tun.Name()
 	if err != nil {
